@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  attribution:
+    # Commits and PR descriptions carry the developer's name only; the commit-msg hook in
+    # .githooks/ catches this locally, this job catches what skipped the hook.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Commits
+        run: >-
+          scripts/check_no_agent_attribution.sh --range
+          "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+      - name: PR description
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s' "$PR_BODY" | scripts/check_no_agent_attribution.sh --stdin
+
