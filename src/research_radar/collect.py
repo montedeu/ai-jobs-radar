@@ -118,21 +118,39 @@ def backfill(
     return counts
 
 
+def _take_collection_lock(connection: psycopg.Connection) -> bool:
+    """True when this session now holds the lock shared by the collection jobs.
+
+    arXiv allows one connection for everything this project runs, and the daily job and
+    the backfill lock the same rows in opposite orders. The lock is held by the session
+    and goes when the connection closes; behind a pooler a session is not ours, and the
+    lock would be handed to whoever gets the backend next. direct_url() has already left
+    the pooler if it knew how; the refusal here catches the rest.
+    """
+    if "-pooler" in (connection.info.host or ""):
+        raise RuntimeError("still connected through Neon's pooler; jobs need the direct URL")
+    return connection.execute("SELECT pg_try_advisory_lock(%s)", (COLLECTION_LOCK,)).fetchone()[0]
+
+
+def check(url: str | None = None) -> None:
+    """Fails unless a collection job could start: the deploy runs this on a new image.
+
+    It goes as far as a job does before its first request to arXiv, with the job's own
+    connection, so a database address or a schema the jobs cannot work with stops the
+    deploy instead of the next scheduled run. A lock held by a running job is not a
+    failure.
+    """
+    with connect(direct_url(url or database_url())) as connection:
+        _take_collection_lock(connection)
+        connection.execute("SELECT backfilled_through, updated_through FROM collection_state")
+        connection.execute("SELECT 1 FROM job_run LIMIT 1")
+
+
 def _run(job: str, work, url: str | None, client: ArxivClient | None) -> None:
     client = client or ArxivClient()
     url = direct_url(url or database_url())
     with connect(url) as connection, record_run(connection, job) as details:
-        # arXiv allows one connection for everything this project runs, and the daily
-        # job and the backfill lock the same rows in opposite orders. The lock is held
-        # by the session and goes when the connection closes; behind a pooler a session
-        # is not ours, and the lock would be handed to whoever gets the backend next.
-        # direct_url() has already left the pooler if it knew how; this catches the rest.
-        if "-pooler" in (connection.info.host or ""):
-            raise RuntimeError("still connected through Neon's pooler; jobs need the direct URL")
-        (alone,) = connection.execute(
-            "SELECT pg_try_advisory_lock(%s)", (COLLECTION_LOCK,)
-        ).fetchone()
-        if not alone:
+        if not _take_collection_lock(connection):
             raise RunSkipped("another collection job is running")
         for category in CATEGORIES:
             try:

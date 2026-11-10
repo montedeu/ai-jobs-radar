@@ -26,3 +26,12 @@ def test_max_papers_must_be_a_positive_number(value, capsys):
     with pytest.raises(SystemExit):
         cli.main(["collect", "--max-papers", value])
     assert "--max-papers" in capsys.readouterr().err
+
+
+def test_check_jobs_runs_the_check(monkeypatch):
+    called = []
+    monkeypatch.setattr(collect, "check", lambda: called.append(True))
+
+    cli.main(["check-jobs"])
+
+    assert called == [True]

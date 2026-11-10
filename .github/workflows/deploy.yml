@@ -83,6 +83,14 @@ jobs:
             --cpu 1 --memory 512Mi --quiet
           gcloud run jobs execute "$MIGRATE_JOB" --wait --quiet
 
+      # The collect job connects differently from the server (its own address, a session
+      # lock), so the server's smoke test says nothing about it. This runs the new image
+      # as far as a job goes before its first request to arXiv, on the migrate job, which
+      # already has the image and the database secret; if it fails, the collect job keeps
+      # the previous image.
+      - name: Check that a collection job could start
+        run: gcloud run jobs execute "$MIGRATE_JOB" --args check-jobs --wait --quiet
+
       # --max-retries 0: a failed run is recorded in the job run log and the next
       # scheduled run picks up from the last success; a blind retry would only repeat
       # the same requests to arXiv. --task-timeout 60m is for the one-off backfill

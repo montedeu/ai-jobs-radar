@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
   # main runs these checks through deploy.yml, which deploys only when they pass.
   workflow_call:
 
@@ -45,6 +45,8 @@ jobs:
         run: uv run ruff format --check
       - name: Test
         run: uv run pytest
+      - name: Hook that protects the growth query
+        run: .claude/hooks/test_protect_island.sh
 
   attribution:
     # Commits and PR descriptions carry the developer's name only; the commit-msg hook in
@@ -63,6 +65,17 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: printf '%s' "$PR_BODY" | scripts/check_no_agent_attribution.sh --stdin
+      # One issue, one branch, one pull request: the issue holds the acceptance criteria
+      # the reviewer checks against. An urgent fix without an issue says so with a label.
+      - name: PR closes an issue
+        if: "!contains(github.event.pull_request.labels.*.name, 'no-issue')"
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! grep -Eiq '\b(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' <<<"$PR_BODY"; then
+            echo "::error::The description names no issue it closes (Closes #N). Add one, or the no-issue label for an urgent fix."
+            exit 1
+          fi
 
   image:
     # Proves the Dockerfile still builds; nothing is pushed. On main, deploy.yml builds

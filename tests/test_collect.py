@@ -357,3 +357,46 @@ def test_jobs_connect_to_the_direct_address_of_a_pooled_url(fake_arxiv, monkeypa
 
     assert len(asked) == 2
     assert all("ep-a-1.x.neon.tech" in url and "pooler" not in url for url in asked)
+
+
+# --- the deploy's check that a job could start ------------------------------------------------
+
+
+def test_check_passes_on_a_migrated_database_without_reaching_arxiv(database_url):
+    collect.check(database_url)
+
+
+def test_check_passes_while_a_job_is_running(database_url):
+    with psycopg.connect(database_url) as running:
+        running.execute("SELECT pg_advisory_lock(%s)", (collect.COLLECTION_LOCK,))
+
+        collect.check(database_url)
+
+
+def test_check_fails_through_a_pooler(database_url, monkeypatch):
+    class Pooled:
+        host = "ep-example-pooler.eu-central-1.aws.neon.tech"
+
+    monkeypatch.setattr(psycopg.Connection, "info", Pooled(), raising=False)
+
+    with pytest.raises(RuntimeError, match="pooler"):
+        collect.check(database_url)
+
+
+def test_check_fails_when_the_schema_is_behind(database_url):
+    from research_radar import migrate
+
+    migrate.downgrade(database_url, "0002")
+
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        collect.check(database_url)
+
+
+def test_check_leaves_no_job_run_and_does_not_block_the_next_job(database_url, fake_arxiv):
+    collect.check(database_url)
+    collect.run(database_url, fake_arxiv)
+
+    with psycopg.connect(database_url) as connection:
+        assert [(run.job, run.status) for run in latest_runs(connection)] == [
+            ("collect", "succeeded")
+        ]
