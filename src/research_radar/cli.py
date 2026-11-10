@@ -4,7 +4,8 @@ import argparse
 
 COMMANDS = {
     "migrate": "apply schema migrations up to the latest",
-    "collect": "run the daily collection job",
+    "collect": "store the papers arXiv published or revised since the last run",
+    "backfill": "store the history of every slice, resuming where it stopped",
     "serve-mcp": "serve the MCP server on $PORT",
 }
 
@@ -25,6 +26,10 @@ def main(argv: list[str] | None = None) -> None:
         from research_radar import collect
 
         collect.run()
+    elif args.command == "backfill":
+        from research_radar import collect
+
+        collect.run_backfill()
     elif args.command == "serve-mcp":
         from research_radar import mcp_server
 

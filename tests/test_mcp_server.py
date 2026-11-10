@@ -40,8 +40,8 @@ def test_unknown_paths_are_rejected_before_routing(client):
     assert client.get("/anything").status_code == 401
 
 
-def test_service_status_reports_the_latest_collect_run(client, database_url):
-    collect.run(database_url)
+def test_service_status_reports_the_latest_collect_run(client, database_url, fake_arxiv):
+    collect.run(database_url, fake_arxiv)
     response = call(client, "tools/call", {"name": "service_status", "arguments": {}})
     assert response.status_code == 200
     (run,) = response.json()["result"]["structuredContent"]["latest_runs"]

@@ -85,14 +85,15 @@ jobs:
 
       # --max-retries 0: a failed run is recorded in the job run log and the next
       # scheduled run picks up from the last success; a blind retry would only repeat
-      # the same requests to arXiv.
+      # the same requests to arXiv. --task-timeout 60m is for the one-off backfill
+      # (--args=backfill, about 20 minutes per year of history); a daily run takes seconds.
       - name: Deploy the collect job
         run: |
           gcloud run jobs deploy "$COLLECT_JOB" \
             --image "$IMAGE" --args collect \
             --service-account "$RUNTIME_SA" \
             --set-secrets DATABASE_URL=database-url:latest \
-            --tasks 1 --parallelism 1 --max-retries 0 --task-timeout 30m \
+            --tasks 1 --parallelism 1 --max-retries 0 --task-timeout 60m \
             --cpu 1 --memory 512Mi --quiet
 
       # The new revision gets the "candidate" tag and no traffic, so Claude's connector

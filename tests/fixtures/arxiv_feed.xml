@@ -1,0 +1,138 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom">
+  <id>https://arxiv.org/api/+wSbviFnuN3nWfw9yc9l0ElIvd8</id>
+  <title>arXiv Query: search_query=cat:cs.CL&amp;id_list=&amp;start=0&amp;max_results=300</title>
+  <updated>2026-11-10T02:31:09Z</updated>
+  <link href="https://arxiv.org/api/query?search_query=cat:cs.CL&amp;start=0&amp;max_results=300&amp;id_list=" type="application/atom+xml"/>
+  <opensearch:itemsPerPage>300</opensearch:itemsPerPage>
+  <opensearch:totalResults>124917</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2611.10486v1</id>
+    <title>Test-Time Scaling for Diffusion Language Models with Frequency-Aware Remasking</title>
+    <updated>2026-11-07T05:26:09Z</updated>
+    <link href="https://arxiv.org/abs/2611.10486v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2611.10486v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Diffusion language models (DLMs) generate text through iterative denoising, where decisions about which tokens to commit or remask strongly affect output quality. Existing certainty-aware strategies rely on instantaneous confidence or entropy, but these local signals can be misleading on difficult reasoning problems. We formulate DLM test-time scaling as adaptive allocation of both inference compute and decoding strategies. Our two-stage approach uses a fast base sampler to solve easy questions, then applies frequency-aware remasking to the remaining hard questions. This strategy tracks how often each token's prediction changes across denoising steps and preferentially commits frequently changing tokens, encouraging samples to explore alternative reasoning paths rather than collapse onto the model's preferred trajectory. Experiments with LLaDA-8B-Instruct and Dream-7B-Instruct show consistent improvements over a strong adaptive allocation baseline, with absolute accuracy gains of up to 3.73 percentage points (LLaDA) and 7.33 percentage points (Dream) on MATH-500, and absolute coverage gains of up to 11.39 percentage points (LLaDA) and 10.98 percentage points (Dream) on HumanEval. On questions unsolved by the base certainty-aware strategy after 100 samples, frequency-aware remasking recovers solutions for 3.75% to 18.75% of examples.</summary>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-11-07T05:26:09Z</published>
+    <arxiv:primary_category term="cs.CL"/>
+    <author>
+      <name>Bowen Zuo</name>
+    </author>
+    <author>
+      <name>Yue Yu</name>
+    </author>
+    <author>
+      <name>Dongruo Zhou</name>
+    </author>
+    <author>
+      <name>Yinglun Zhu</name>
+    </author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2611.10469v1</id>
+    <title>Hibana: Fast Agentic Inference on Unified-Memory Devices</title>
+    <updated>2026-11-07T04:38:35Z</updated>
+    <link href="https://arxiv.org/abs/2611.10469v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2611.10469v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Local AI promises capable personal assistants that run on users' own devices, keeping data and computation under their control. Open-weight models that fit on local devices can now handle practical tasks such as coding. Yet current inference engines fall short. Popular engines such as vLLM and SGLang target datacenter GPUs with dedicated host memory, while local engines underuse the memory hierarchy of unified-memory devices. We present Hibana, an inference engine for unified-memory devices that co-optimizes model representation, memory management, and decoding strategy. Model surgery, the process of editing a trained model's architecture to suit its hardware, changes how the model computes, shrinking its memory footprint and data movement. Unified-memory management preserves each agent's state across turns, so long-running agents can resume instantly instead of recomputing their state. Adaptive speculation generates several tokens per step. Hibana codesigns these features around the shared memory capacity and limited bandwidth of unified-memory systems-on-chip to support local multi-agent workloads. On a single DGX Spark serving Qwen and Nemotron models of up to 125B parameters, Hibana completes up to 3.4$\times$ more agentic tasks per hour and delivers up to 3.9$\times$ higher decoding throughput than other established frameworks such as vLLM, NVIDIA Flare, llama.cpp, and TensorFold. Code is available at https://github.com/sharar-project/hibana.</summary>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-11-07T04:38:35Z</published>
+    <arxiv:primary_category term="cs.CL"/>
+    <author>
+      <name>Yahya Emara</name>
+    </author>
+    <author>
+      <name>Chi-Chih Chang</name>
+    </author>
+    <author>
+      <name>Anthony Fei</name>
+    </author>
+    <author>
+      <name>Ahmed F. AbouElhamayed</name>
+    </author>
+    <author>
+      <name>Chong-Yan Chen</name>
+    </author>
+    <author>
+      <name>Hung-Yueh Chiang</name>
+    </author>
+    <author>
+      <name>Kai-Chiang Wu</name>
+    </author>
+    <author>
+      <name>Mohamed S. Abdelfattah</name>
+    </author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2605.03780v2</id>
+    <title>Task Vector Geometry Underlies Dual Modes of Task Inference in Transformers</title>
+    <updated>2026-11-07T05:55:00Z</updated>
+    <link href="https://arxiv.org/abs/2605.03780v2" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2605.03780v2" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Transformers are effective at inferring the latent task from context via two inference modes: recognizing a task seen during training, and adapting to a novel one. Recent interpretability studies have identified from middle-layer representations task-specific directions, or task vectors, that steer model behavior. However, a lack of rigorous foundations hinders connecting internal representations to external model behavior: existing work fails to explain how task-vector geometry is shaped by the training distribution, and what geometry enables out-of-distribution (OOD) generalization. In this paper, we study these questions in a controlled synthetic setting by training small transformers from scratch on latent-task sequence distributions, which allows a principled mathematical characterization. We show that two inference modes can coexist within a single model. In-distribution behavior is governed by Bayesian task retrieval, implemented internally through convex combinations of learned task vectors. OOD behavior, by contrast, arises through extrapolative task learning, whose representations occupy a subspace nearly orthogonal to the task-vector subspace. Taken together, our results suggest that task-vector geometry, training distributions, and generalization behaviors are closely related.</summary>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="stat.ML" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-05-05T14:07:55Z</published>
+    <arxiv:comment>82 pages. Revised version with expanded experiments and additional appendices</arxiv:comment>
+    <arxiv:primary_category term="cs.LG"/>
+    <author>
+      <name>Hao Yan</name>
+    </author>
+    <author>
+      <name>Haolin Yang</name>
+    </author>
+    <author>
+      <name>Yiqiao Zhong</name>
+    </author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2510.11052v3</id>
+    <title>Latent Refinement Decoding: Enhancing Diffusion-Based Language Models by Refining Belief States</title>
+    <updated>2026-11-06T22:30:17Z</updated>
+    <link href="https://arxiv.org/abs/2510.11052v3" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2510.11052v3" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Autoregressive (AR) models remain the dominant paradigm for natural language generation, but their strictly sequential decoding process leads to high inference latency. Recent diffusion-inspired language models, such as LLaDA and Dream, alleviate this issue through parallel generation, yet they still face two key limitations: information loss, since predictive distributions over non-finalised tokens are discarded at each step, and unstable commitment dynamics, where local token decisions are not sufficiently coordinated at the global level. We propose Latent Refinement Decoding (LRD), a two-stage decoding framework consisting of Latent Refinement and a Predictive Feedback Loop. In the first stage, LRD keeps masked positions as distributional mixtures of predicted tokens and the mask embedding, enabling the model to form more globally consistent beliefs before committing tokens. In the second stage, LRD progressively finalises confident tokens while preserving uncertain ones for further iterative refinement, with KL-divergence dynamics serving as a stable criterion for convergence and early stopping. Experiments show that LRD improves performance on both coding tasks, including HumanEval by 6.3 and MBPP by 2.6, and reasoning tasks, including GSM8K by 2.9 and MATH500 by 3.8, while achieving up to 10.6x overall speedup. Moreover, LRD is compatible with single-token decoding, multi-token threshold commitment, and system-level accelerators; when combined with Fast-dLLM, it reaches up to 18.4x speedup over vanilla decoding while further improving accuracy.</summary>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2025-10-13T06:38:13Z</published>
+    <arxiv:comment>Accepted at NeurIPS 2026</arxiv:comment>
+    <arxiv:primary_category term="cs.CL"/>
+    <author>
+      <name>Qinglin Zhu</name>
+    </author>
+    <author>
+      <name>Yizhen Yao</name>
+    </author>
+    <author>
+      <name>Runcong Zhao</name>
+    </author>
+    <author>
+      <name>Yanzheng Xiang</name>
+    </author>
+    <author>
+      <name>Siya Qi</name>
+    </author>
+    <author>
+      <name>Amrutha Saseendran</name>
+    </author>
+    <author>
+      <name>Chen Jin</name>
+    </author>
+    <author>
+      <name>Philip Teare</name>
+    </author>
+    <author>
+      <name>Bin Liang</name>
+    </author>
+    <author>
+      <name>Yulan He</name>
+    </author>
+    <author>
+      <name>Lin Gui</name>
+    </author>
+  </entry>
+</feed>

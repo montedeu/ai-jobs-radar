@@ -39,8 +39,8 @@ def test_latest_runs_returns_one_row_per_job(database_url):
     assert sorted(run.job for run in runs) == ["collect", "extract"]
 
 
-def test_collect_job_leaves_a_succeeded_run(database_url):
-    collect.run(database_url)
+def test_collect_job_leaves_a_succeeded_run(database_url, fake_arxiv):
+    collect.run(database_url, fake_arxiv)
     with psycopg.connect(database_url) as connection:
         (run,) = latest_runs(connection)
     assert (run.job, run.status) == ("collect", "succeeded")

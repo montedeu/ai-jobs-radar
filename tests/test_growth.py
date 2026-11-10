@@ -42,11 +42,11 @@ class Corpus:
         arxiv_id = f"p{self._papers:04d}"
         self.connection.execute(
             """
-            INSERT INTO paper (arxiv_id, title, abstract, abstract_hash, authors,
-                               primary_category, first_version_date)
-            VALUES (%s, 't', 'a', 'h', '[]', %s, %s)
+            INSERT INTO paper (arxiv_id, version, title, abstract, abstract_hash, authors,
+                               primary_category, first_version_date, arxiv_updated_at)
+            VALUES (%s, 1, 't', 'a', 'h', '[]', %s, %s, %s)
             """,
-            (arxiv_id, categories[0], day),
+            (arxiv_id, categories[0], day, day),
         )
         for category in categories:
             self.connection.execute(
