@@ -4,6 +4,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from research_radar.database import database_url
 
@@ -25,3 +26,10 @@ def upgrade(url: str | None = None, revision: str = "head") -> None:
 
 def downgrade(url: str | None = None, revision: str = "base") -> None:
     command.downgrade(alembic_config(url), revision)
+
+
+def head_revision() -> str:
+    """The newest schema revision this code ships with."""
+    config = Config()
+    config.set_main_option("script_location", str(MIGRATIONS))
+    return ScriptDirectory.from_config(config).get_current_head()

@@ -10,7 +10,7 @@ from functools import partial
 
 import psycopg
 
-from research_radar import papers
+from research_radar import migrate, papers
 from research_radar.arxiv_api import ArxivClient, Paper
 from research_radar.database import connect, database_url, direct_url
 from research_radar.job_log import RunSkipped, record_run
@@ -138,12 +138,19 @@ def check(url: str | None = None) -> None:
     It goes as far as a job does before its first request to arXiv, with the job's own
     connection, so a database address or a schema the jobs cannot work with stops the
     deploy instead of the next scheduled run. A lock held by a running job is not a
-    failure.
+    failure: that job is the proof.
     """
     with connect(direct_url(url or database_url())) as connection:
         _take_collection_lock(connection)
-        connection.execute("SELECT backfilled_through, updated_through FROM collection_state")
-        connection.execute("SELECT 1 FROM job_run LIMIT 1")
+        (schema,) = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        if schema != migrate.head_revision():
+            raise RuntimeError(
+                f"the database is at schema {schema}, this code needs {migrate.head_revision()}"
+            )
+        # A job's first act is to write its row to the run log; a read-only role or a
+        # full database would stop it there. Rolled back, so the log shows no such run.
+        connection.execute("INSERT INTO job_run (job) VALUES ('check-jobs')")
+        connection.rollback()
 
 
 def _run(job: str, work, url: str | None, client: ArxivClient | None) -> None:

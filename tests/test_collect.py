@@ -386,9 +386,17 @@ def test_check_fails_through_a_pooler(database_url, monkeypatch):
 def test_check_fails_when_the_schema_is_behind(database_url):
     from research_radar import migrate
 
-    migrate.downgrade(database_url, "0002")
+    migrate.downgrade(database_url, "-1")
 
-    with pytest.raises(psycopg.errors.UndefinedTable):
+    with pytest.raises(RuntimeError, match="this code needs"):
+        collect.check(database_url)
+
+
+def test_check_fails_when_the_run_log_cannot_be_written(database_url):
+    with psycopg.connect(database_url, autocommit=True) as admin:
+        admin.execute("ALTER TABLE job_run ADD CONSTRAINT no_writes CHECK (false) NOT VALID")
+
+    with pytest.raises(psycopg.errors.CheckViolation):
         collect.check(database_url)
 
 
