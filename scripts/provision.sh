@@ -429,9 +429,11 @@ pause
 # ── 7 ─────────────────────────────────────────────────────────────────────
 stage "Workload Identity Federation"
 REPO_ID=$(gh api "repos/$GITHUB_REPO" --jq .id)
-CONDITION="assertion.repository=='$GITHUB_REPO' && assertion.repository_id=='$REPO_ID'"
+# The branch is part of the condition: a workflow on any other branch of this repo would
+# otherwise get the deployer's rights too, whatever deploy.yml says about main.
+CONDITION="assertion.repository=='$GITHUB_REPO' && assertion.repository_id=='$REPO_ID' && assertion.ref=='refs/heads/main'"
 MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.repository_id=assertion.repository_id,attribute.ref=assertion.ref"
-say "Only GitHub Actions tokens from $GITHUB_REPO (id $REPO_ID) will be accepted:"
+say "Only GitHub Actions tokens from the main branch of $GITHUB_REPO (id $REPO_ID) will be accepted:"
 note "$CONDITION"
 if ! gcloud iam workload-identity-pools describe "$WIF_POOL" --location=global --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
   run gcloud iam workload-identity-pools create "$WIF_POOL" --location=global \
@@ -584,63 +586,26 @@ pause
 
 # ── 13 ────────────────────────────────────────────────────────────────────
 stage "Prove WIF works from GitHub Actions"
-say "This pushes a throwaway branch with a workflow that authenticates through WIF"
-say "and reads the Artifact Registry repository, watches the run, then deletes the branch."
-note "The run stays in the Actions tab as evidence. Your working tree is untouched."
-if confirm "Push the throwaway branch and run it?"; then
-  BRANCH="wif-smoke-$(date +%Y%m%d%H%M%S)"
-  WORKTREE=$(mktemp -d)
-  run git fetch --quiet origin main
-  run git worktree add --quiet -b "$BRANCH" "$WORKTREE" origin/main
-  mkdir -p "$WORKTREE/.github/workflows"
-  cat > "$WORKTREE/.github/workflows/wif-smoke.yml" <<'YAML'
-name: wif-smoke
-on:
-  push:
-    branches: ["wif-smoke-*"]
-permissions:
-  contents: read
-  id-token: write
-jobs:
-  auth:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SA }}
-      - uses: google-github-actions/setup-gcloud@v3
-      - name: Call GCP as the deployer
-        run: |
-          gcloud auth list
-          gcloud artifacts repositories describe "${{ vars.GAR_REPOSITORY }}" \
-            --project="${{ vars.GCP_PROJECT_ID }}" --location="${{ vars.GCP_REGION }}" \
-            --format='value(name)'
-YAML
-  run git -C "$WORKTREE" add .github/workflows/wif-smoke.yml
-  run git -C "$WORKTREE" commit --quiet -m "Throwaway: prove WIF auth from GitHub Actions"
-  run git -C "$WORKTREE" push --quiet origin "$BRANCH"
-  say "Waiting for the run to start…"
-  RUN_ID=""
-  for _ in $(seq 1 30); do
-    RUN_ID=$(gh run list --repo "$GITHUB_REPO" --branch "$BRANCH" --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
-    [[ -n "$RUN_ID" ]] && break
-    sleep 3
-  done
-  if [[ -z "$RUN_ID" ]]; then
-    warn "No run appeared; check the Actions tab."
-    SKIPPED+=("WIF smoke run on branch $BRANCH: check Actions, then git push origin --delete $BRANCH")
-  elif gh run watch "$RUN_ID" --repo "$GITHUB_REPO" --exit-status; then
-    printf '  %s✓ WIF auth works%s: https://github.com/%s/actions/runs/%s\n' "$GREEN" "$RESET" "$GITHUB_REPO" "$RUN_ID"
+say "Only a workflow on main can authenticate, so the proof is a workflow on main: this"
+say "starts the Deploy workflow by hand and watches it authenticate and deploy."
+note "While DEPLOY_ENABLED is unset the deploy job is skipped and proves nothing; in that"
+note "case the first real deploy is the proof."
+if [[ "$(gh variable get DEPLOY_ENABLED --repo "$GITHUB_REPO" 2>/dev/null || true)" == "true" ]]; then
+  if confirm "Run the Deploy workflow on main now?"; then
+    run gh workflow run deploy.yml --repo "$GITHUB_REPO" --ref main
+    sleep 8
+    RUN_ID=$(gh run list --repo "$GITHUB_REPO" --workflow deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+    if gh run watch "$RUN_ID" --repo "$GITHUB_REPO" --exit-status; then
+      printf '  %s✓ WIF auth works%s: https://github.com/%s/actions/runs/%s\n' "$GREEN" "$RESET" "$GITHUB_REPO" "$RUN_ID"
+    else
+      warn "The run failed: https://github.com/$GITHUB_REPO/actions/runs/$RUN_ID"
+      SKIPPED+=("fix the Deploy run $RUN_ID, then re-run this wizard")
+    fi
   else
-    warn "The run failed: https://github.com/$GITHUB_REPO/actions/runs/$RUN_ID"
-    SKIPPED+=("fix the WIF smoke run $RUN_ID, then re-run this wizard")
+    SKIPPED+=("WIF proof: gh workflow run deploy.yml --ref main")
   fi
-  git worktree remove --force "$WORKTREE"
-  git push --quiet origin --delete "$BRANCH" || SKIPPED+=("delete branch: git push origin --delete $BRANCH")
-  git branch --quiet -D "$BRANCH"
 else
-  SKIPPED+=("WIF smoke test from GitHub Actions")
+  say "DEPLOY_ENABLED is not set yet; it is the next thing this wizard does."
 fi
 pause
 
