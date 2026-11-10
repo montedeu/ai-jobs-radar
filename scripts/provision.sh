@@ -586,34 +586,50 @@ pause
 
 # ── 13 ────────────────────────────────────────────────────────────────────
 stage "Prove WIF works from GitHub Actions"
-say "Only a workflow on main can authenticate, so the proof is a workflow on main: this"
-say "starts the Deploy workflow by hand and watches it authenticate and deploy."
-note "While DEPLOY_ENABLED is unset the deploy job is skipped and proves nothing; in that"
-note "case the first real deploy is the proof."
-if [[ "$(gh variable get DEPLOY_ENABLED --repo "$GITHUB_REPO" 2>/dev/null || true)" == "true" ]]; then
-  if confirm "Run the Deploy workflow on main now?"; then
-    run gh workflow run deploy.yml --repo "$GITHUB_REPO" --ref main
-    sleep 8
-    RUN_ID=$(gh run list --repo "$GITHUB_REPO" --workflow deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')
-    if gh run watch "$RUN_ID" --repo "$GITHUB_REPO" --exit-status; then
-      printf '  %s✓ WIF auth works%s: https://github.com/%s/actions/runs/%s\n' "$GREEN" "$RESET" "$GITHUB_REPO" "$RUN_ID"
-    else
-      warn "The run failed: https://github.com/$GITHUB_REPO/actions/runs/$RUN_ID"
-      SKIPPED+=("fix the Deploy run $RUN_ID, then re-run this wizard")
-    fi
+say "Only a workflow on main can authenticate, so the proof runs on main: the 'WIF check'"
+say "workflow signs in as the deployer and reads the image repository. It deploys nothing."
+if ! gh workflow view wif-check.yml --repo "$GITHUB_REPO" >/dev/null 2>&1; then
+  warn "The 'WIF check' workflow is not on main yet; merge it, then re-run this wizard."
+  SKIPPED+=("WIF proof: gh workflow run wif-check.yml --ref main")
+elif confirm "Run the WIF check on main now?"; then
+  latest_run() {
+    gh run list --repo "$GITHUB_REPO" --workflow wif-check.yml --limit 1 \
+      --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || true
+  }
+  # The run started here is the first one with an id other than this.
+  BEFORE=$(latest_run)
+  run gh workflow run wif-check.yml --repo "$GITHUB_REPO" --ref main
+  say "Waiting for the run to start…"
+  RUN_ID=""
+  for _ in $(seq 1 30); do
+    RUN_ID=$(latest_run)
+    [[ -n "$RUN_ID" && "$RUN_ID" != "$BEFORE" ]] && break
+    RUN_ID=""
+    sleep 3
+  done
+  if [[ -z "$RUN_ID" ]]; then
+    warn "No run appeared; check the Actions tab."
+    SKIPPED+=("WIF proof: gh workflow run wif-check.yml --ref main, then watch it in Actions")
+  elif gh run watch "$RUN_ID" --repo "$GITHUB_REPO" --exit-status; then
+    printf '  %s✓ WIF auth works%s: https://github.com/%s/actions/runs/%s\n' "$GREEN" "$RESET" "$GITHUB_REPO" "$RUN_ID"
   else
-    SKIPPED+=("WIF proof: gh workflow run deploy.yml --ref main")
+    warn "The WIF check failed: https://github.com/$GITHUB_REPO/actions/runs/$RUN_ID"
+    SKIPPED+=("WIF check run $RUN_ID failed: read its log, fix the provider or the bindings above")
   fi
 else
-  say "DEPLOY_ENABLED is not set yet; it is the next thing this wizard does."
+  SKIPPED+=("WIF proof: gh workflow run wif-check.yml --ref main")
 fi
 pause
 
 # Last on purpose: the deploy workflow is skipped until this is set, so a merge to main
 # while the stages above are half done deploys nothing.
-if (( ${#SKIPPED[@]} )); then
+if [[ "$(gh variable get DEPLOY_ENABLED --repo "$GITHUB_REPO" 2>/dev/null || true)" == "true" ]]; then
+  say "Deploys are already on (DEPLOY_ENABLED is true); this wizard leaves that as it is."
+  (( ${#SKIPPED[@]} )) && warn "Some steps were skipped (listed next); deploys stay on regardless."
+elif (( ${#SKIPPED[@]} )); then
   warn "Some steps were skipped (listed next), so deploys stay off."
-  note "Re-run this wizard, or turn them on yourself: gh variable set DEPLOY_ENABLED --body true"
+  note "Finish them and re-run this wizard, or turn deploys on yourself:"
+  note "  gh variable set DEPLOY_ENABLED --body true"
 else
   set_var DEPLOY_ENABLED true
 fi
