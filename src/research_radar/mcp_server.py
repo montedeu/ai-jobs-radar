@@ -45,7 +45,7 @@ async def health(request: Request) -> PlainTextResponse:
     """
     try:
         await run_in_threadpool(_read_database)
-    except Exception as error:
+    except (Exception, SystemExit) as error:  # SystemExit: DATABASE_URL is not set
         return PlainTextResponse(f"database: {type(error).__name__}", status_code=503)
     return PlainTextResponse("ok")
 

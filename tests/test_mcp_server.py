@@ -44,6 +44,12 @@ def test_health_fails_when_the_database_cannot_be_read(client, monkeypatch):
     assert "ConnectionError" in response.text
 
 
+def test_health_fails_cleanly_when_no_database_is_configured(client, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL")
+
+    assert client.get("/health").status_code == 503
+
+
 @pytest.mark.parametrize("path", ["/health/", "//health", "/health/../mcp", "/HEALTH"])
 def test_only_the_exact_health_path_is_open(client, path):
     assert client.get(path).status_code == 401

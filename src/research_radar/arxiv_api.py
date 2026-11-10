@@ -130,16 +130,19 @@ class ArxivClient:
                 page = parse_feed(self._get(params))
             except (httpx.HTTPError, ElementTree.ParseError) as error:
                 problem = f"{type(error).__name__}: {error}"
+                zero_results_seen = False
             else:
                 if page.papers or start >= page.total > 0:
                     return page
                 if page.total == 0:
                     # Under load the API sometimes answers "no results" for a query
                     # that has some. A caller that believed it would mark the day as
-                    # read and never return, so zero has to be said twice.
+                    # read and never return, so zero has to be said twice in a row.
                     if zero_results_seen:
                         return page
                     zero_results_seen = True
+                else:
+                    zero_results_seen = False
                 problem = f"empty page at {start} of {page.total}"
             if attempt < ATTEMPTS:
                 self._sleep(SECONDS_BETWEEN_REQUESTS * 2**attempt)

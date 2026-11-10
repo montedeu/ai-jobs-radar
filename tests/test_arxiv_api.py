@@ -164,3 +164,11 @@ def test_gives_up_after_the_allowed_attempts():
     with pytest.raises(ArxivUnavailable, match="503"):
         list(recorder.client().latest_updated("cs.CL"))
     assert len(recorder.requests) == ATTEMPTS
+
+
+def test_zero_results_must_be_repeated_back_to_back():
+    zero = feed_with_total(0, entries=False)
+    recorder = Recorder([zero, 503, zero, feed_with_total(4)])
+
+    assert len(list(recorder.client().submitted_on("cs.CL", date(2026, 11, 5)))) == 4
+    assert len(recorder.requests) == 4

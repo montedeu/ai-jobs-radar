@@ -286,17 +286,19 @@ def test_interrupted_backfill_keeps_the_days_it_finished(connection, fake_arxiv)
 # --- one collection job at a time -------------------------------------------------------------
 
 
-def test_second_collection_job_does_nothing_while_one_is_running(database_url, fake_arxiv):
+def test_second_collection_job_is_skipped_not_failed_while_one_is_running(database_url, fake_arxiv):
     fake_arxiv.papers = [paper("new")]
     with psycopg.connect(database_url) as running:
         running.execute("SELECT pg_advisory_lock(%s)", (collect.COLLECTION_LOCK,))
 
-        with pytest.raises(RuntimeError, match="another collection job"):
-            collect.run(database_url, fake_arxiv)
+        collect.run(database_url, fake_arxiv)
 
     with psycopg.connect(database_url) as connection:
         (run,) = latest_runs(connection)
-        assert run.status == "failed"
+        assert (run.status, run.details) == (
+            "skipped",
+            {"skipped": "another collection job is running"},
+        )
         assert not stored(connection, "new")
         assert fake_arxiv.requests == 0
 
@@ -319,3 +321,21 @@ def test_limit_of_the_daily_job_can_be_raised_for_one_run(connection, fake_arxiv
     counts = collect.collect_updates(connection, fake_arxiv, "cs.CL", max_papers=10)
 
     assert counts["new"] == 4
+
+
+def test_limit_of_zero_is_not_read_as_no_limit_given(connection, fake_arxiv):
+    fake_arxiv.papers = [paper("only")]
+
+    with pytest.raises(RuntimeError, match="more than 0 papers"):
+        collect.collect_updates(connection, fake_arxiv, "cs.CL", max_papers=0)
+
+
+def test_jobs_refuse_a_pooled_connection(database_url, fake_arxiv, monkeypatch):
+    class Pooled:
+        host = "ep-example-pooler.eu-central-1.aws.neon.tech"
+
+    monkeypatch.setattr(psycopg.Connection, "info", Pooled(), raising=False)
+
+    with pytest.raises(RuntimeError, match="direct URL"):
+        collect.run(database_url, fake_arxiv)
+    assert fake_arxiv.requests == 0

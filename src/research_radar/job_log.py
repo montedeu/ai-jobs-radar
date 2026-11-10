@@ -19,6 +19,10 @@ class JobRun(BaseModel):
     details: dict[str, Any]
 
 
+class RunSkipped(Exception):
+    """Raised inside ``record_run`` when the job has nothing to do and nothing is wrong."""
+
+
 @contextmanager
 def record_run(connection: psycopg.Connection, job: str) -> Iterator[dict[str, Any]]:
     """Logs a run of ``job``; the caller fills the yielded dict with what the run did.
@@ -33,6 +37,13 @@ def record_run(connection: psycopg.Connection, job: str) -> Iterator[dict[str, A
     details: dict[str, Any] = {}
     try:
         yield details
+    except RunSkipped as reason:
+        # Logged apart from failures and not re-raised: the job exits cleanly, and a
+        # reader of the log is not sent looking for a fault.
+        connection.rollback()
+        details["skipped"] = str(reason)
+        _finish(connection, run_id, "skipped", details)
+        return
     except BaseException as error:
         connection.rollback()
         details["error"] = f"{type(error).__name__}: {error}"

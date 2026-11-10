@@ -13,7 +13,7 @@ import psycopg
 from research_radar import papers
 from research_radar.arxiv_api import ArxivClient, Paper
 from research_radar.database import connect
-from research_radar.job_log import record_run
+from research_radar.job_log import RunSkipped, record_run
 from research_radar.settings import CATEGORIES, HISTORY_START
 
 # How far before the previous run's mark the daily job re-reads. arXiv publishes in
@@ -64,6 +64,7 @@ def collect_updates(
     now = datetime.now(UTC)
     read_back_to = (updated_through or now - FIRST_RUN_LOOKBACK) - UPDATE_OVERLAP
 
+    limit = MAX_PAPERS_PER_DAILY_RUN if max_papers is None else max_papers
     counts: Counter = Counter()
     batch: list[Paper] = []
     newest: datetime | None = None
@@ -72,9 +73,9 @@ def collect_updates(
             break
         newest = newest or paper.arxiv_updated_at
         batch.append(paper)
-        if len(batch) > (max_papers or MAX_PAPERS_PER_DAILY_RUN):
+        if len(batch) > limit:
             raise RuntimeError(
-                f"{category}: more than {max_papers or MAX_PAPERS_PER_DAILY_RUN} papers "
+                f"{category}: more than {limit} papers "
                 f"updated since {read_back_to:%Y-%m-%d %H:%M}; refusing to continue. If "
                 "the job was simply down for a long time, run it once with --max-papers"
             )
@@ -122,12 +123,15 @@ def _run(job: str, work, url: str | None, client: ArxivClient | None) -> None:
     with connect(url) as connection, record_run(connection, job) as details:
         # arXiv allows one connection for everything this project runs, and the daily
         # job and the backfill lock the same rows in opposite orders. The lock is held
-        # by the session and goes when the connection closes.
+        # by the session and goes when the connection closes; behind a pooler a session
+        # is not ours, and the lock would be handed to whoever gets the backend next.
+        if "-pooler" in (connection.info.host or ""):
+            raise RuntimeError("DATABASE_URL points at Neon's pooler; jobs need the direct URL")
         (alone,) = connection.execute(
             "SELECT pg_try_advisory_lock(%s)", (COLLECTION_LOCK,)
         ).fetchone()
         if not alone:
-            raise RuntimeError("another collection job is running; this one did nothing")
+            raise RunSkipped("another collection job is running")
         for category in CATEGORIES:
             try:
                 details[category] = dict(work(connection, client, category))

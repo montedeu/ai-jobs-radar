@@ -10,14 +10,21 @@ COMMANDS = {
 }
 
 
+def _positive(text: str) -> int:
+    number = int(text)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="radar")
     commands = parser.add_subparsers(dest="command", required=True)
     parsers = {name: commands.add_parser(name, help=summary) for name, summary in COMMANDS.items()}
     parsers["collect"].add_argument(
         "--max-papers",
-        type=int,
-        help="raise the limit on papers read in one run, after the job was down for long",
+        type=_positive,
+        help="the limit on papers read in this run; raise it after the job was down for long",
     )
     args = parser.parse_args(argv)
 

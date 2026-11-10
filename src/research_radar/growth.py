@@ -42,6 +42,10 @@ def entity_growth(
     min_mentions: int = DEFAULT_MIN_MENTIONS,
     new_max_previous: int = DEFAULT_NEW_MAX_PREVIOUS,
 ) -> list[EntityGrowth]:
+    # The query is promised this by docs/growth-query.md: with a bound of 0 nothing is
+    # ever new, and a rising entity could have no ratio to sort by.
+    if not 1 <= new_max_previous <= min_mentions:
+        raise ValueError("new_max_previous must be between 1 and min_mentions")
     parameters = {
         "run_id": run_id,
         "category": category,
