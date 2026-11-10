@@ -125,14 +125,29 @@ def test_submitted_on_asks_for_one_utc_day():
     list(recorder.client().submitted_on("cs.CL", date(2026, 11, 5)))
 
     ((_, params),) = recorder.requests
-    assert params["search_query"] == "cat:cs.CL AND submittedDate:[202611050000 TO 202611052359]"
+    assert params["search_query"] == "cat:cs.CL AND submittedDate:[202611050000 TO 202611060000]"
 
 
-def test_day_without_papers_is_not_an_error():
-    recorder = Recorder([feed_with_total(0, entries=False)])
+def test_day_without_papers_is_believed_only_when_arxiv_says_so_twice():
+    recorder = Recorder([feed_with_total(0, entries=False)] * 2)
 
     assert list(recorder.client().submitted_on("cs.CL", date(2026, 11, 8))) == []
-    assert len(recorder.requests) == 1
+    assert len(recorder.requests) == 2
+
+
+def test_wrong_zero_results_answer_does_not_lose_the_day():
+    recorder = Recorder([feed_with_total(0, entries=False), feed_with_total(4)])
+
+    assert len(list(recorder.client().submitted_on("cs.CL", date(2026, 11, 5)))) == 4
+
+
+def test_submitted_on_reaches_the_last_minute_of_the_month():
+    recorder = Recorder([feed_with_total(4)])
+
+    list(recorder.client().submitted_on("cs.CL", date(2026, 11, 30)))
+
+    ((_, params),) = recorder.requests
+    assert params["search_query"].endswith("[202611300000 TO 202612010000]")
 
 
 @pytest.mark.parametrize("failure", [503, 429, feed_with_total(50, entries=False), "<broken"])

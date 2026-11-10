@@ -13,8 +13,12 @@ COMMANDS = {
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="radar")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name, summary in COMMANDS.items():
-        commands.add_parser(name, help=summary)
+    parsers = {name: commands.add_parser(name, help=summary) for name, summary in COMMANDS.items()}
+    parsers["collect"].add_argument(
+        "--max-papers",
+        type=int,
+        help="raise the limit on papers read in one run, after the job was down for long",
+    )
     args = parser.parse_args(argv)
 
     # Imported per command: a job does not pay for loading the web stack.
@@ -25,7 +29,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "collect":
         from research_radar import collect
 
-        collect.run()
+        collect.run(max_papers=args.max_papers)
     elif args.command == "backfill":
         from research_radar import collect
 

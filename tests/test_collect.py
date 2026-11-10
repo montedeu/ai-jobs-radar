@@ -92,6 +92,14 @@ def test_older_version_from_a_stale_page_does_not_overwrite(connection):
     assert stored(connection, "1")[:2] == (3, "Third.")
 
 
+def test_older_version_from_a_stale_page_does_not_change_categories(connection):
+    papers.store(connection, paper("1", version=2, categories=["cs.CL", "cs.AI"]))
+
+    papers.store(connection, paper("1", version=1, categories=["cs.CL"]))
+
+    assert categories(connection, "1") == ["cs.AI", "cs.CL"]
+
+
 def test_category_added_without_a_new_version_is_picked_up(connection):
     papers.store(connection, paper("1", categories=["cs.LG"], primary_category="cs.LG"))
 
@@ -273,3 +281,41 @@ def test_interrupted_backfill_keeps_the_days_it_finished(connection, fake_arxiv)
     assert connection.execute("SELECT backfilled_through FROM collection_state").fetchone() == (
         HISTORY_START + timedelta(days=1),
     )
+
+
+# --- one collection job at a time -------------------------------------------------------------
+
+
+def test_second_collection_job_does_nothing_while_one_is_running(database_url, fake_arxiv):
+    fake_arxiv.papers = [paper("new")]
+    with psycopg.connect(database_url) as running:
+        running.execute("SELECT pg_advisory_lock(%s)", (collect.COLLECTION_LOCK,))
+
+        with pytest.raises(RuntimeError, match="another collection job"):
+            collect.run(database_url, fake_arxiv)
+
+    with psycopg.connect(database_url) as connection:
+        (run,) = latest_runs(connection)
+        assert run.status == "failed"
+        assert not stored(connection, "new")
+        assert fake_arxiv.requests == 0
+
+
+def test_collection_runs_again_once_the_other_job_is_done(database_url, fake_arxiv):
+    with psycopg.connect(database_url) as finished:
+        finished.execute("SELECT pg_advisory_lock(%s)", (collect.COLLECTION_LOCK,))
+
+    collect.run(database_url, fake_arxiv)
+    collect.run_backfill(database_url, fake_arxiv)
+
+
+def test_limit_of_the_daily_job_can_be_raised_for_one_run(connection, fake_arxiv, monkeypatch):
+    monkeypatch.setattr(collect, "MAX_PAPERS_PER_DAILY_RUN", 2)
+    fake_arxiv.papers = [paper(str(n)) for n in range(4)]
+
+    with pytest.raises(RuntimeError, match="--max-papers"):
+        collect.collect_updates(connection, fake_arxiv, "cs.CL")
+    connection.rollback()
+    counts = collect.collect_updates(connection, fake_arxiv, "cs.CL", max_papers=10)
+
+    assert counts["new"] == 4
