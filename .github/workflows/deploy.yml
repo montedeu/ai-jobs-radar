@@ -20,10 +20,10 @@ jobs:
 
   deploy:
     needs: checks
-    # The dispatch button offers every branch; only main may go live. Until
-    # scripts/provision.sh has set the repository variables there is nowhere to deploy
-    # to, and the job is skipped rather than failed.
-    if: github.ref == 'refs/heads/main' && vars.GCP_PROJECT_ID != ''
+    # The dispatch button offers every branch; only main may go live. DEPLOY_ENABLED is
+    # the last thing scripts/provision.sh sets: until then there is nowhere to deploy to,
+    # or only half of it, and the job is skipped rather than failed.
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

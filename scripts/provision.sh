@@ -644,10 +644,19 @@ else
 fi
 pause
 
+# Last on purpose: the deploy workflow is skipped until this is set, so a merge to main
+# while the stages above are half done deploys nothing.
+if (( ${#SKIPPED[@]} )); then
+  warn "Some steps were skipped (listed next), so deploys stay off."
+  note "Re-run this wizard, or turn them on yourself: gh variable set DEPLOY_ENABLED --body true"
+else
+  set_var DEPLOY_ENABLED true
+fi
+
 finish
 say "GitHub variables: GCP_PROJECT_ID GCP_REGION GAR_REPOSITORY GCP_DEPLOY_SA GCP_RUNTIME_SA GCP_WIF_PROVIDER"
 say "Secret Manager:   $DB_SECRET, $TOKEN_SECRET (read by $RUNTIME_SA_NAME)"
-say "Next: merge to main; the Deploy workflow creates the jobs and the MCP server."
+say "Next: run the Deploy workflow on main (gh workflow run deploy.yml); it creates the jobs and the MCP server."
 printf '\n'
 }
 
