@@ -1,0 +1,153 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # redeploys main without a commit
+
+permissions:
+  contents: read
+
+concurrency:
+  # One deploy at a time. A running deploy is never cancelled; a newer push replaces
+  # one still waiting, so the latest commit is what ends up live.
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: checks
+    # The dispatch button offers every branch; only main may go live. Until
+    # scripts/provision.sh has set the repository variables there is nowhere to deploy
+    # to, and the job is skipped rather than failed.
+    if: github.ref == 'refs/heads/main' && vars.GCP_PROJECT_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # the GitHub OIDC token that Workload Identity Federation exchanges
+    env:
+      CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      CLOUDSDK_RUN_REGION: ${{ vars.GCP_REGION }}
+      RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA }}
+      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/research-radar:${{ github.sha }}
+      MIGRATE_JOB: radar-migrate
+      COLLECT_JOB: radar-collect
+      MCP_SERVICE: radar-mcp
+    # Actions pinned to commits: this job holds a token that can deploy.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Short-lived credentials for the deployer service account; no JSON key exists.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Log Docker in to Artifact Registry
+        run: gcloud auth configure-docker "$CLOUDSDK_RUN_REGION-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The only image build on main; it also refreshes the layer cache PRs read.
+      - name: Build and push the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}
+          # One manifest per deploy, no attestation alongside it, so the registry's cleanup
+          # policy (scripts/provision.sh) counts deploys exactly.
+          provenance: false
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,mode=max,scope=image
+
+      # Migrations run as their own Cloud Run job, before any new code is live and from
+      # one place: the service and the collect job never migrate on start, so they cannot
+      # race each other. The database URL is a Secret Manager reference; its value never
+      # passes through this workflow.
+      - name: Apply schema migrations
+        run: |
+          gcloud run jobs deploy "$MIGRATE_JOB" \
+            --image "$IMAGE" --args migrate \
+            --service-account "$RUNTIME_SA" \
+            --set-secrets DATABASE_URL=database-url:latest \
+            --tasks 1 --max-retries 0 --task-timeout 5m \
+            --cpu 1 --memory 512Mi --quiet
+          gcloud run jobs execute "$MIGRATE_JOB" --wait --quiet
+
+      # --max-retries 0: a failed run is recorded in the job run log and the next
+      # scheduled run picks up from the last success; a blind retry would only repeat
+      # the same requests to arXiv.
+      - name: Deploy the collect job
+        run: |
+          gcloud run jobs deploy "$COLLECT_JOB" \
+            --image "$IMAGE" --args collect \
+            --service-account "$RUNTIME_SA" \
+            --set-secrets DATABASE_URL=database-url:latest \
+            --tasks 1 --parallelism 1 --max-retries 0 --task-timeout 30m \
+            --cpu 1 --memory 512Mi --quiet
+
+      # The new revision gets the "candidate" tag and no traffic, so Claude's connector
+      # stays on the current revision until the smoke test has passed on the new one.
+      # --allow-unauthenticated: the connector calls from Anthropic's cloud with a fixed
+      # header, not a Google identity; the server itself checks the bearer token.
+      - name: Deploy a candidate revision of the MCP server
+        id: deploy
+        run: |
+          traffic=()
+          if gcloud run services describe "$MCP_SERVICE" >/dev/null 2>&1; then
+            traffic=(--no-traffic) # refused when the service is created
+            # What serves now, recorded before anything changes: the promotion tags it
+            # "previous", and a failed or cancelled deploy goes back to it.
+            serving=$(gcloud run services describe "$MCP_SERVICE" --format=json | jq -r \
+              '[.status.traffic[] | select(.percent > 0)] | max_by(.percent) | .revisionName // empty')
+            echo "serving=$serving" >> "$GITHUB_OUTPUT"
+          fi
+          gcloud run deploy "$MCP_SERVICE" \
+            --image "$IMAGE" --args serve-mcp \
+            --service-account "$RUNTIME_SA" \
+            --allow-unauthenticated \
+            --min-instances 0 --max-instances 1 --cpu 1 --memory 512Mi \
+            --set-secrets DATABASE_URL=database-url:latest,MCP_TOKEN=mcp-token:latest \
+            --tag candidate "${traffic[@]}" \
+            --quiet
+
+      - name: Smoke-test the candidate revision
+        run: |
+          url=$(gcloud run services describe "$MCP_SERVICE" --format=json \
+            | jq -r '.status.traffic[] | select(.tag == "candidate") | .url')
+          echo "candidate: $url"
+          python3 scripts/smoke_test.py "$url"
+
+      - name: Send all traffic to the tested revision
+        env:
+          SERVING: ${{ steps.deploy.outputs.serving }}
+        run: |
+          tags=()
+          [[ -n "$SERVING" ]] && tags=(--update-tags "previous=$SERVING") # the rollback target
+          gcloud run services update-traffic "$MCP_SERVICE" --to-tags candidate=100 "${tags[@]}" --quiet
+          url=$(gcloud run services describe "$MCP_SERVICE" --format='value(status.url)')
+          python3 scripts/smoke_test.py "$url"
+          echo "### MCP server live at $url/mcp ($(git rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
+
+      # A failed or cancelled deploy goes back to what served before: traffic, and the
+      # candidate tag, so "candidate" always names the last revision that passed. The
+      # failed revision stays, untagged and without traffic (Cloud Run won't delete the
+      # newest revision of a service). Migrations are not rolled back: a migration must
+      # keep the previous revision's queries working.
+      - name: Undo a failed deploy
+        if: (failure() || cancelled()) && steps.deploy.outputs.serving != ''
+        env:
+          SERVING: ${{ steps.deploy.outputs.serving }}
+        run: |
+          gcloud run services update-traffic "$MCP_SERVICE" \
+            --to-revisions "$SERVING=100" --update-tags "candidate=$SERVING" --quiet
+          echo "### Deploy failed: still serving $SERVING" >> "$GITHUB_STEP_SUMMARY"

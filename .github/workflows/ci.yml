@@ -3,8 +3,49 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
+  # main runs these checks through deploy.yml, which deploys only when they pass.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded PR runs are cancelled. On main, deploy.yml's own concurrency decides.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  checks:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: radar
+          POSTGRES_PASSWORD: radar
+          POSTGRES_DB: radar
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U radar"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgresql://radar:radar@localhost:5432/radar
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check --output-format=github
+      - name: Format
+        run: uv run ruff format --check
+      - name: Test
+        run: uv run pytest
+
   attribution:
     # Commits and PR descriptions carry the developer's name only; the commit-msg hook in
     # .githooks/ catches this locally, this job catches what skipped the hook.
@@ -23,3 +64,21 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: printf '%s' "$PR_BODY" | scripts/check_no_agent_attribution.sh --stdin
 
+  image:
+    # Proves the Dockerfile still builds; nothing is pushed. On main, deploy.yml builds
+    # and pushes the image itself, so this job would only build it a second time.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          push: false
+          # Only main's deploy writes the cache: a PR's entries are visible to that PR
+          # alone and would crowd main's out.
+          cache-from: type=gha,scope=image

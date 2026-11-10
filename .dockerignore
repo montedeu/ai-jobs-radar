@@ -1,0 +1,11 @@
+# Allowlist: everything stays out of the build context unless named below,
+# so a new file at the repo root (a secret, a dataset) can't slip into the image.
+*
+
+!pyproject.toml
+!uv.lock
+!src/
+
+# Exceptions inside the allowed directories.
+**/__pycache__
+**/*.pyc
