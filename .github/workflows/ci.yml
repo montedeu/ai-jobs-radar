@@ -45,6 +45,8 @@ jobs:
         run: uv run ruff format --check
       - name: Test
         run: uv run pytest
+      - name: Hook that protects the growth query
+        run: .claude/hooks/test_protect_island.sh
 
   attribution:
     # Commits and PR descriptions carry the developer's name only; the commit-msg hook in

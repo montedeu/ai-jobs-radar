@@ -6,6 +6,7 @@ COMMANDS = {
     "migrate": "apply schema migrations up to the latest",
     "collect": "store the papers arXiv published or revised since the last run",
     "backfill": "store the history of every slice, resuming where it stopped",
+    "check-jobs": "fail unless a collection job could start (no request to arXiv)",
     "serve-mcp": "serve the MCP server on $PORT",
 }
 
@@ -37,6 +38,10 @@ def main(argv: list[str] | None = None) -> None:
         from research_radar import collect
 
         collect.run(max_papers=args.max_papers)
+    elif args.command == "check-jobs":
+        from research_radar import collect
+
+        collect.check()
     elif args.command == "backfill":
         from research_radar import collect
 

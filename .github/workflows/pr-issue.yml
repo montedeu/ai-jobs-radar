@@ -1,0 +1,26 @@
+name: PR issue link
+
+# Its own workflow so that a label change re-runs this one cheap check and not the tests
+# and the image build.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions: {}
+
+jobs:
+  issue-link:
+    # The issue holds the acceptance criteria the reviewer checks the diff against. This
+    # only checks that the description names an issue to close, not that the issue is
+    # the right one. An urgent fix without an issue says so with the no-issue label.
+    if: "!contains(github.event.pull_request.labels.*.name, 'no-issue')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: The description names the issue it closes
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! grep -Eiq '\b(close[sd]?|fix(e[sd])?|resolve[sd]?):?[[:space:]]+([[:alnum:]_./-]+)?#[0-9]+' <<<"$PR_BODY"; then
+            echo "::error::The description names no issue it closes (Closes #N). Add one, or the no-issue label for an urgent fix."
+            exit 1
+          fi
