@@ -1,6 +1,7 @@
 """Connections to the radar's Postgres database."""
 
 import os
+import re
 import time
 
 import psycopg
@@ -27,11 +28,26 @@ def direct_url(url: str) -> str:
     its whole run, and behind the pooler a session is not the job's own.
     """
     parts = conninfo_to_dict(url)
-    host = parts.get("host") or ""
-    endpoint, dot, rest = host.partition(".")
-    if endpoint.endswith("-pooler"):
-        parts["host"] = endpoint.removesuffix("-pooler") + dot + rest
+    hosts = [_without_pooler(host) for host in (parts.get("host") or "").split(",")]
+    if parts.get("hostaddr") and hosts != (parts.get("host") or "").split(","):
+        # libpq connects to hostaddr and ignores the name, so renaming would change nothing.
+        raise ValueError("the database address pins a pooler by hostaddr; use the direct URL")
+    if parts.get("host"):
+        parts["host"] = ",".join(hosts)
+    if parts.get("options"):
+        # Clients without SNI name the endpoint here instead of in the host.
+        parts["options"] = _POOLED_ENDPOINT_OPTION.sub(r"\1", parts["options"])
     return make_conninfo(**parts)
+
+
+_POOLED_ENDPOINT_OPTION = re.compile(r"(endpoint=[\w-]+?)-pooler\b", re.IGNORECASE)
+
+
+def _without_pooler(host: str) -> str:
+    endpoint, dot, rest = host.partition(".")
+    if endpoint.lower().endswith("-pooler"):
+        endpoint = endpoint[: -len("-pooler")]
+    return endpoint + dot + rest
 
 
 def connect(url: str | None = None) -> psycopg.Connection:

@@ -339,3 +339,21 @@ def test_jobs_refuse_a_pooled_connection(database_url, fake_arxiv, monkeypatch):
     with pytest.raises(RuntimeError, match="direct URL"):
         collect.run(database_url, fake_arxiv)
     assert fake_arxiv.requests == 0
+
+
+def test_jobs_connect_to_the_direct_address_of_a_pooled_url(fake_arxiv, monkeypatch):
+    asked = []
+
+    def record(url):
+        asked.append(url)
+        raise ConnectionError("stop here: the address is all this test needs")
+
+    monkeypatch.setattr(collect, "connect", record)
+    pooled = "postgresql://u:p@ep-a-1-pooler.x.neon.tech/db"
+
+    for job in (collect.run, collect.run_backfill):
+        with pytest.raises(ConnectionError):
+            job(pooled, fake_arxiv)
+
+    assert len(asked) == 2
+    assert all("ep-a-1.x.neon.tech" in url and "pooler" not in url for url in asked)
