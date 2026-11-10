@@ -28,15 +28,16 @@ def store(connection: psycopg.Connection, paper: Paper) -> Outcome:
         (paper.arxiv_id,),
     ).fetchone()
     if existing and existing[1] >= paper.version:
-        # The same version again, or an older one from a stale page.
         outcome: Outcome = "unchanged"
     elif existing:
         outcome = "abstract_changed" if existing[0] != new_hash else "updated"
     else:
         outcome = "new"
     if outcome == "unchanged":
-        # Categories can be added to a paper without a new version.
-        _replace_categories(connection, paper)
+        if existing[1] == paper.version:
+            # arXiv adds a category to a paper without a new version. An older version,
+            # served from a stale page, must not undo that.
+            _replace_categories(connection, paper)
         return outcome
     connection.execute(
         """

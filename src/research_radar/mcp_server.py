@@ -6,6 +6,7 @@ import os
 import uvicorn
 from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -37,7 +38,21 @@ def service_status() -> ServiceStatus:
 
 @server.custom_route(HEALTH_PATH, methods=["GET"])
 async def health(request: Request) -> PlainTextResponse:
+    """Up and able to read the migrated database.
+
+    The deploy sends traffic to a new revision on the strength of this answer, so a
+    revision that cannot reach its database must not say it is fine.
+    """
+    try:
+        await run_in_threadpool(_read_database)
+    except (Exception, SystemExit) as error:  # SystemExit: DATABASE_URL is not set
+        return PlainTextResponse(f"database: {type(error).__name__}", status_code=503)
     return PlainTextResponse("ok")
+
+
+def _read_database() -> None:
+    with connect() as connection:
+        connection.execute("SELECT 1 FROM job_run LIMIT 1")
 
 
 class BearerToken:
@@ -48,8 +63,14 @@ class BearerToken:
         self.expected = f"Bearer {token}".encode()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] == HEALTH_PATH:
+        if scope["type"] == "lifespan" or (
+            scope["type"] == "http" and scope["path"] == HEALTH_PATH
+        ):
             await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            # Nothing here speaks websocket; a route added later must not arrive open.
+            await send({"type": "websocket.close", "code": 1008})
             return
         given = dict(scope["headers"]).get(b"authorization", b"")
         if not hmac.compare_digest(given, self.expected):

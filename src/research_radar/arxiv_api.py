@@ -8,7 +8,7 @@ import re
 import time
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable, Iterator
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import httpx
 from pydantic import BaseModel
@@ -124,14 +124,25 @@ class ArxivClient:
             "max_results": PAGE_SIZE,
         }
         problem = ""
+        zero_results_seen = False
         for attempt in range(1, ATTEMPTS + 1):
             try:
                 page = parse_feed(self._get(params))
             except (httpx.HTTPError, ElementTree.ParseError) as error:
                 problem = f"{type(error).__name__}: {error}"
+                zero_results_seen = False
             else:
-                if page.papers or start >= page.total:
+                if page.papers or start >= page.total > 0:
                     return page
+                if page.total == 0:
+                    # Under load the API sometimes answers "no results" for a query
+                    # that has some. A caller that believed it would mark the day as
+                    # read and never return, so zero has to be said twice in a row.
+                    if zero_results_seen:
+                        return page
+                    zero_results_seen = True
+                else:
+                    zero_results_seen = False
                 problem = f"empty page at {start} of {page.total}"
             if attempt < ATTEMPTS:
                 self._sleep(SECONDS_BETWEEN_REQUESTS * 2**attempt)
@@ -148,8 +159,11 @@ class ArxivClient:
 
     def submitted_on(self, category: str, day: date) -> Iterator[Paper]:
         """Papers of the slice whose first version was submitted on ``day`` (UTC)."""
-        stamp = day.strftime("%Y%m%d")
-        query = f"cat:{category} AND submittedDate:[{stamp}0000 TO {stamp}2359]"
+        # The range has minute resolution; ending it at 23:59 could leave out the last
+        # minute of the day. Midnight of the next day overlaps by a minute instead, and
+        # a paper read twice is stored once.
+        start, end = day.strftime("%Y%m%d"), (day + timedelta(days=1)).strftime("%Y%m%d")
+        query = f"cat:{category} AND submittedDate:[{start}0000 TO {end}0000]"
         return self._pages(query, "submittedDate", "ascending")
 
     def latest_updated(self, category: str) -> Iterator[Paper]:

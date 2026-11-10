@@ -6,13 +6,14 @@ changes nothing, and each job records how far it got only after committing that 
 
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 
 import psycopg
 
 from research_radar import papers
 from research_radar.arxiv_api import ArxivClient, Paper
 from research_radar.database import connect
-from research_radar.job_log import record_run
+from research_radar.job_log import RunSkipped, record_run
 from research_radar.settings import CATEGORIES, HISTORY_START
 
 # How far before the previous run's mark the daily job re-reads. arXiv publishes in
@@ -27,6 +28,8 @@ FIRST_RUN_LOOKBACK = timedelta(days=7)
 MAX_PAPERS_PER_DAILY_RUN = 5000
 # arXiv finishes publishing a day's submissions later; a day this recent may be incomplete.
 BACKFILL_LAG_DAYS = 2
+# An arbitrary constant: the key of the Postgres advisory lock shared by both jobs.
+COLLECTION_LOCK = 20251101
 
 
 def _state(connection: psycopg.Connection, category: str) -> tuple[date | None, datetime | None]:
@@ -48,13 +51,20 @@ def _store_all(connection: psycopg.Connection, batch: list[Paper], counts: Count
         counts["received"] += 1
 
 
-def collect_updates(connection: psycopg.Connection, client: ArxivClient, category: str) -> Counter:
+def collect_updates(
+    connection: psycopg.Connection,
+    client: ArxivClient,
+    category: str,
+    *,
+    max_papers: int | None = None,
+) -> Counter:
     """Stores every Paper of the slice that is new or has a new version since the last run."""
     _, updated_through = _state(connection, category)
     connection.commit()
     now = datetime.now(UTC)
     read_back_to = (updated_through or now - FIRST_RUN_LOOKBACK) - UPDATE_OVERLAP
 
+    limit = MAX_PAPERS_PER_DAILY_RUN if max_papers is None else max_papers
     counts: Counter = Counter()
     batch: list[Paper] = []
     newest: datetime | None = None
@@ -63,13 +73,14 @@ def collect_updates(connection: psycopg.Connection, client: ArxivClient, categor
             break
         newest = newest or paper.arxiv_updated_at
         batch.append(paper)
-        if len(batch) > MAX_PAPERS_PER_DAILY_RUN:
+        if len(batch) > limit:
             raise RuntimeError(
-                f"{category}: more than {MAX_PAPERS_PER_DAILY_RUN} papers updated since "
-                f"{read_back_to:%Y-%m-%d %H:%M}; refusing to continue"
+                f"{category}: more than {limit} papers "
+                f"updated since {read_back_to:%Y-%m-%d %H:%M}; refusing to continue. If "
+                "the job was simply down for a long time, run it once with --max-papers"
             )
-    # Everything is stored in one transaction with the mark: either the whole run
-    # counts or none of it does.
+    # One transaction for the papers and the mark: a run that fails halfway must leave
+    # the mark where it was, or the papers it did not store would never be read.
     _store_all(connection, batch, counts)
     if newest:
         connection.execute(
@@ -110,6 +121,17 @@ def backfill(
 def _run(job: str, work, url: str | None, client: ArxivClient | None) -> None:
     client = client or ArxivClient()
     with connect(url) as connection, record_run(connection, job) as details:
+        # arXiv allows one connection for everything this project runs, and the daily
+        # job and the backfill lock the same rows in opposite orders. The lock is held
+        # by the session and goes when the connection closes; behind a pooler a session
+        # is not ours, and the lock would be handed to whoever gets the backend next.
+        if "-pooler" in (connection.info.host or ""):
+            raise RuntimeError("DATABASE_URL points at Neon's pooler; jobs need the direct URL")
+        (alone,) = connection.execute(
+            "SELECT pg_try_advisory_lock(%s)", (COLLECTION_LOCK,)
+        ).fetchone()
+        if not alone:
+            raise RunSkipped("another collection job is running")
         for category in CATEGORIES:
             try:
                 details[category] = dict(work(connection, client, category))
@@ -117,8 +139,10 @@ def _run(job: str, work, url: str | None, client: ArxivClient | None) -> None:
                 details["requests"] = client.requests
 
 
-def run(url: str | None = None, client: ArxivClient | None = None) -> None:
-    _run("collect", collect_updates, url, client)
+def run(
+    url: str | None = None, client: ArxivClient | None = None, max_papers: int | None = None
+) -> None:
+    _run("collect", partial(collect_updates, max_papers=max_papers), url, client)
 
 
 def run_backfill(url: str | None = None, client: ArxivClient | None = None) -> None:

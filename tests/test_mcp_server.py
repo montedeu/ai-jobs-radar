@@ -1,5 +1,6 @@
 import pytest
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from research_radar import collect, mcp_server
 
@@ -29,6 +30,34 @@ def test_server_refuses_to_start_without_a_token():
 
 def test_health_needs_no_token(client):
     assert client.get("/health").status_code == 200
+
+
+def test_health_fails_when_the_database_cannot_be_read(client, monkeypatch):
+    def unreachable():
+        raise ConnectionError("no route to the database")
+
+    monkeypatch.setattr(mcp_server, "connect", unreachable)
+
+    response = client.get("/health")
+
+    assert response.status_code == 503
+    assert "ConnectionError" in response.text
+
+
+def test_health_fails_cleanly_when_no_database_is_configured(client, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL")
+
+    assert client.get("/health").status_code == 503
+
+
+@pytest.mark.parametrize("path", ["/health/", "//health", "/health/../mcp", "/HEALTH"])
+def test_only_the_exact_health_path_is_open(client, path):
+    assert client.get(path).status_code == 401
+
+
+def test_websocket_is_refused(client):
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/mcp"):
+        pass
 
 
 @pytest.mark.parametrize("token", [None, "wrong", TOKEN + "x", ""])
