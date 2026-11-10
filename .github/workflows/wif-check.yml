@@ -1,0 +1,30 @@
+name: WIF check
+
+# Proves that a workflow on main can authenticate to Google Cloud as the deployer, without
+# deploying anything. The provider accepts tokens from main only (scripts/provision.sh),
+# so this cannot be tried from a branch; scripts/provision.sh starts it by hand.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  authenticate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    # Pinned to commits, like deploy.yml: this job holds the deployer's token.
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Read the image repository as the deployer
+        run: |
+          gcloud artifacts repositories describe "${{ vars.GAR_REPOSITORY }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" --location="${{ vars.GCP_REGION }}" \
+            --format='value(name)'
