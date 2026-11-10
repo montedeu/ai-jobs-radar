@@ -29,3 +29,39 @@ def database_url(postgres_url):
     migrate.downgrade(postgres_url, "base")
     migrate.upgrade(postgres_url)
     return postgres_url
+
+
+class FakeArxiv:
+    """Stands in for ArxivClient: serves the Papers it was given, and counts requests."""
+
+    def __init__(self, papers=()):
+        self.papers = list(papers)
+        self.requests = 0
+        self.days_asked = []
+
+    def latest_updated(self, category):
+        self.requests += 1
+        matching = [p for p in self.papers if category in p.categories]
+        return iter(sorted(matching, key=lambda p: p.arxiv_updated_at, reverse=True))
+
+    def submitted_on(self, category, day):
+        self.requests += 1
+        self.days_asked.append(day)
+        return iter(
+            p for p in self.papers if category in p.categories and p.first_version_date == day
+        )
+
+
+@pytest.fixture
+def fake_arxiv():
+    return FakeArxiv()
+
+
+@pytest.fixture(autouse=True)
+def no_real_arxiv(monkeypatch):
+    """A test that forgets to pass a fake client fails instead of calling arXiv."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a test tried to reach arXiv")
+
+    monkeypatch.setattr("httpx.Client.get", refuse)
