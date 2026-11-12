@@ -501,3 +501,58 @@ def test_the_missing_count_is_taken_after_the_sending(connection, current, monke
     daily_extraction.extract_daily(connection, FakeModel, details=details)
 
     assert seen == [1]
+
+
+def test_abandon_confirm_gives_up_only_the_status_it_described(
+    connection, current, cli_database, monkeypatch
+):
+    batch_id = add_batch(connection, current, "sending", ["2511.00002"])
+    real = extraction.abandon_batch
+
+    def late(connection, batch_id, **kwargs):
+        connection.execute(
+            "UPDATE extraction_batch SET status = 'submitted' WHERE id = %s", (batch_id,)
+        )
+        return real(connection, batch_id, **kwargs)
+
+    monkeypatch.setattr(extraction, "abandon_batch", late)
+
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["abandon-batch", str(batch_id), "--confirm"])
+
+    assert str(stop.value.code).startswith("error: ")
+    assert status_of(connection, batch_id) == "submitted"
+
+
+def test_batch_errors_that_are_not_a_dict_are_hidden():
+    run = mcp_server.JobRun(
+        job="extract",
+        started_at="2026-11-12T06:00Z",
+        finished_at=None,
+        status="failed",
+        details={"batch_errors": ["RuntimeError: secret"]},
+    )
+
+    assert mcp_server._without_error_text(run).details["batch_errors"] == "(скрыто)"
+
+
+def test_abandon_batch_refuses_a_bare_string_of_statuses(connection, current):
+    batch_id = add_batch(connection, current, "sending", ["2511.00002"])
+
+    with pytest.raises(TypeError):
+        extraction.abandon_batch(connection, batch_id, statuses="sending")
+
+    assert status_of(connection, batch_id) == "sending"
+
+
+def test_abandon_sending_skips_a_batch_that_is_gone(connection, monkeypatch):
+    add_paper(connection, "2511.00001")
+    head = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    add_batch(connection, head, "sending", ["2511.00001"])
+
+    def gone(connection, batch_id, **kwargs):
+        raise LookupError(f"no extraction batch {batch_id}")
+
+    monkeypatch.setattr(extraction, "abandon_batch", gone)
+
+    run_full(connection, abandon_sending=True)

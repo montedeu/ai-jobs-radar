@@ -279,7 +279,7 @@ def abandon_batch(
     connection: psycopg.Connection,
     batch_id: int,
     *,
-    statuses: Sequence[str] = ("sending", "submitted"),
+    statuses: tuple[str, ...] = ("sending", "submitted"),
 ) -> int:
     """Gives up a batch that is in one of ``statuses``; returns the number of its papers.
 
@@ -290,6 +290,8 @@ def abandon_batch(
     another status.
     The connection must have no transaction open.
     """
+    if isinstance(statuses, str):
+        raise TypeError("statuses is a tuple of statuses, not one string")
     require_idle(connection)
     with connection.transaction():
         # The update takes the row lock, so a collector storing the batch at this moment

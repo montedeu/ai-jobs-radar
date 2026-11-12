@@ -57,7 +57,8 @@ def _abandon_batch(connection, extraction, batch_id: int, confirm: bool) -> None
         print("Nothing was changed. Run again with --confirm to give it up.")
         return
     try:
-        extraction.abandon_batch(connection, batch_id)
+        # Only the status that was just described: it may have changed since.
+        extraction.abandon_batch(connection, batch_id, statuses=(status,))
     except (LookupError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error
     print(f"Abandoned batch {batch_id}: its {papers} papers are due again.")

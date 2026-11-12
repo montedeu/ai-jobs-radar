@@ -49,7 +49,9 @@ def _without_error_text(run: JobRun) -> JobRun:
     details = dict(run.details)
     if isinstance(details.get("error"), str):
         details["error"] = _type_only(details["error"])
-    if isinstance(details.get("batch_errors"), dict):
+    if "batch_errors" in details and not isinstance(details["batch_errors"], dict):
+        details["batch_errors"] = "(скрыто)"
+    elif isinstance(details.get("batch_errors"), dict):
         details["batch_errors"] = {
             batch: _type_only(text) if isinstance(text, str) else "(скрыто)"
             for batch, text in details["batch_errors"].items()
