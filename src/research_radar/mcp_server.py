@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from research_radar.database import connect
+from research_radar.history_summary import HistorySummary, history_summary
 from research_radar.job_log import JobRun, latest_runs
 
 HEALTH_PATH = "/health"
@@ -27,13 +28,20 @@ server = MCPServer(
 
 class ServiceStatus(BaseModel):
     latest_runs: list[JobRun]
+    history: HistorySummary
 
 
 @server.tool()
 def service_status() -> ServiceStatus:
-    """When each of the radar's scheduled jobs last ran and how it ended."""
+    """When each scheduled job last ran and how it ended, and what the database holds.
+
+    `history` gives, per slice, the papers per calendar month (by paper date), how far the
+    history is collected, the days inside it without a paper, and the database size.
+    """
     with connect() as connection:
-        return ServiceStatus(latest_runs=latest_runs(connection))
+        return ServiceStatus(
+            latest_runs=latest_runs(connection), history=history_summary(connection)
+        )
 
 
 @server.custom_route(HEALTH_PATH, methods=["GET"])
