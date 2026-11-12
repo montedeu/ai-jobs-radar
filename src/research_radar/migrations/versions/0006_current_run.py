@@ -32,12 +32,15 @@ def upgrade() -> None:
         );
 
         -- What became of each paper of a collected batch. 'invalid' is an answer that was
-        -- paid for and is not in the schema; 'unanswered' is a request the API errored,
-        -- expired or canceled, which costs nothing. Only 'invalid' counts toward giving
-        -- up on a paper. NULL: the batch is not collected, or was before this column.
+        -- paid for and is not in the schema; 'errored' is a request the API rejected,
+        -- 'expired' and 'canceled' ones it did not run. Only 'invalid' and 'errored' count
+        -- toward giving up on a paper.
         ALTER TABLE extraction_batch_paper
             ADD COLUMN outcome text
-            CHECK (outcome IN ('extracted', 'invalid', 'unanswered', 'stale'));
+            CHECK (outcome IN ('extracted', 'invalid', 'errored', 'expired', 'canceled', 'stale'));
+        COMMENT ON COLUMN extraction_batch_paper.outcome IS
+            'NULL for a batch not collected yet, and for batches collected before migration '
+            '0006; those are not counted as attempts when a run gives up on a paper';
 
         -- The check for giving up looks at a run's batches and at a paper's rows.
         CREATE INDEX extraction_batch_run ON extraction_batch (run_id);

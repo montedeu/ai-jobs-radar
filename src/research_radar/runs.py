@@ -29,21 +29,19 @@ _MISSING = (
 """
 )
 
-# Whether the run is unfinished, how many papers of its scope it gave up on, and the size
-# of the scope.
+# One pass over the scope: how many papers still hold the run back, how many it gave up
+# on, and the size of the scope.
 _STATE = (
     """
-    SELECT EXISTS ("""
-    + _MISSING
-    + """),
-           (SELECT count(*)
-              FROM extraction_run_scope s JOIN ("""
+    SELECT count(*) FILTER (WHERE e.arxiv_id IS NULL AND g.arxiv_id IS NULL),
+           count(*) FILTER (WHERE e.arxiv_id IS NULL AND g.arxiv_id IS NOT NULL),
+           count(*)
+      FROM extraction_run_scope s
+      LEFT JOIN paper_extraction e ON e.run_id = s.run_id AND e.arxiv_id = s.arxiv_id
+      LEFT JOIN ("""
     + GIVEN_UP_SQL
-    + """) g USING (arxiv_id)
-             WHERE s.run_id = %(run)s
-               AND NOT EXISTS (SELECT 1 FROM paper_extraction e
-                                WHERE e.run_id = s.run_id AND e.arxiv_id = s.arxiv_id)),
-           (SELECT count(*) FROM extraction_run_scope WHERE run_id = %(run)s)
+    + """) g ON g.arxiv_id = s.arxiv_id
+     WHERE s.run_id = %(run)s
 """
 )
 
@@ -84,9 +82,9 @@ def promote(connection: psycopg.Connection) -> int | None:
 
     Only a full run created after the current one is considered, so an older run never
     takes the place of a newer one, and a run that is current is not switched to again.
-    A run that gave up on more than EXTRACTION_MAX_GIVEN_UP_SHARE of its scope is not
-    switched to: that is a failure of the run, not of a few papers. The connection must have
-    no transaction open, as in extraction.
+    A run that gave up on more than one paper and on more than EXTRACTION_MAX_GIVEN_UP_SHARE
+    of its scope is not switched to: that is a failure of the run, not of a few papers.
+    The connection must have no transaction open, as in extraction.
     """
     require_idle(connection)
     with connection.transaction():
@@ -103,12 +101,12 @@ def promote(connection: psycopg.Connection) -> int | None:
             (current_run(connection),),
         ).fetchall()
         for (run_id,) in candidates:
-            unfinished, given_up, scope = connection.execute(
+            missing, given_up, scope = connection.execute(
                 _STATE, {"run": run_id, "attempts": EXTRACTION_MAX_ATTEMPTS}
             ).fetchone()
-            if unfinished:
+            if missing:
                 continue
-            if given_up > EXTRACTION_MAX_GIVEN_UP_SHARE * scope:
+            if given_up > max(1, EXTRACTION_MAX_GIVEN_UP_SHARE * scope):
                 log.warning(
                     "run %s covered its scope but gave up on %s of %s papers; not switching",
                     run_id,

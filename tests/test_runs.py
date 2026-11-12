@@ -217,9 +217,35 @@ def test_batches_the_api_failed_are_not_attempts(connection, papers):
     filler = add_filler(connection, 97)
     run = new_run(connection)
     mark_done(connection, run, *CL[:2], *filler)
-    for outcome in ("unanswered", "stale", "extracted", None):
+    for outcome in ("expired", "canceled", "stale", "extracted", None):
         fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS, outcome=outcome)
     assert missing_papers(connection, run) == [CL[2]]
+    assert promote(connection) is None
+
+
+def test_a_request_the_api_always_rejects_is_given_up_on(connection, papers):
+    filler = add_filler(connection, 97)
+    run = new_run(connection)
+    mark_done(connection, run, *CL[:2], *filler)
+    fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS, outcome="errored")
+    assert missing_papers(connection, run) == []
+    assert promote(connection) == run
+
+
+def test_one_given_up_paper_never_locks_a_small_scope(connection, papers):
+    filler = add_filler(connection, 57)  # 60 papers: one is 1.7%, over the share
+    run = new_run(connection)
+    mark_done(connection, run, *CL[:2], *filler)
+    fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS)
+    assert promote(connection) == run
+
+
+def test_two_given_up_papers_of_a_small_scope_do_lock_it(connection, papers):
+    filler = add_filler(connection, 57)
+    run = new_run(connection)
+    mark_done(connection, run, CL[0], *filler)
+    for arxiv_id in CL[1:]:
+        fail_attempts(connection, run, arxiv_id, EXTRACTION_MAX_ATTEMPTS)
     assert promote(connection) is None
 
 

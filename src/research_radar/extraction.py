@@ -42,7 +42,7 @@ EXTRACTION_PROMPT = (
 # characters; an arXiv id has a dot. A new-style id has nothing else, so the swap is
 # reversible. An id of another shape (an old "hep-th/9901001") cannot be sent; submit
 # leaves such papers out.
-ARXIV_ID = re.compile(r"[0-9]{4}\.[0-9]{4,5}")
+_ARXIV_ID = re.compile(r"[0-9]{4}\.[0-9]{4,5}")
 
 
 def prompt_hash() -> str:
@@ -63,6 +63,9 @@ class ExtractionResult:
     mentions: PaperMentions | None
     input_tokens: int
     output_tokens: int
+    # How a request that got no answer ended: "errored", "expired" or "canceled". None for
+    # a request the model answered, usable or not.
+    unanswered: str | None = None
 
 
 class BatchRejected(Exception):
@@ -135,7 +138,7 @@ def start_run(
                 {
                     "run": run_id,
                     "start": HISTORY_START,
-                    "shape": f"^{ARXIV_ID.pattern}$",
+                    "shape": f"^{_ARXIV_ID.pattern}$",
                     "slices": list(CATEGORIES),
                 },
             )
@@ -148,7 +151,8 @@ def _usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
 
 
 # The papers a run has given up on, with the hash of the abstract the attempts were made on:
-# those with EXTRACTION_MAX_ATTEMPTS paid, unusable answers to the abstract they have now.
+# those with EXTRACTION_MAX_ATTEMPTS paid, unusable answers ('invalid') or API rejections
+# ('errored') to the abstract they have now. Expired and canceled requests do not count.
 # One grouped pass over the run's batches. _due and runs.py both use it, so a paper the
 # full run stops waiting for is also one the daily job stops paying for.
 GIVEN_UP_SQL = """
@@ -156,7 +160,7 @@ GIVEN_UP_SQL = """
       FROM extraction_batch b
       JOIN extraction_batch_paper bp ON bp.batch_id = b.id
       JOIN paper p ON p.arxiv_id = bp.arxiv_id AND p.abstract_hash = bp.abstract_hash
-     WHERE b.run_id = %(run)s AND b.status = 'collected' AND bp.outcome = 'invalid'
+     WHERE b.run_id = %(run)s AND b.status = 'collected' AND bp.outcome IN ('invalid', 'errored')
      GROUP BY bp.arxiv_id, bp.abstract_hash
     HAVING count(*) >= %(attempts)s
 """
@@ -196,7 +200,7 @@ def submit(
     sent is always the hash of what was sent. Returns None when there is nothing to send.
     Raises BudgetExceeded, before anything is sent, when the batch's most expensive outcome
     plus what is spent passes the ceiling. Ids of a shape that cannot be sent (see
-    ARXIV_ID) are left out of the batch and logged as a warning.
+    _ARXIV_ID) are left out of the batch and logged as a warning.
 
     The batch is recorded as 'sending' before it is sent: a failure after that leaves the
     row, counted in the budget, instead of a paid batch nobody knows about. Only a refusal
@@ -268,7 +272,7 @@ def submit(
 def _supported(arxiv_ids: Sequence[str]) -> list[str]:
     """The ids of a shape that can be sent; the others are left out and logged."""
     unique = list(dict.fromkeys(arxiv_ids))
-    supported = {i for i in unique if ARXIV_ID.fullmatch(i)}
+    supported = {i for i in unique if _ARXIV_ID.fullmatch(i)}
     if len(supported) < len(unique):
         unsupported = [i for i in unique if i not in supported]
         log.warning("not sent, arXiv id of an unsupported shape: %s", ", ".join(unsupported))
@@ -401,6 +405,7 @@ def _store_batch(
     )
     counter: Counter = Counter()
     seen: set[str] = set()
+    outcomes: list[tuple[str, int, str]] = []
     input_tokens = output_tokens = 0
     for result in results:
         # Every answer is billed, whatever becomes of it.
@@ -411,10 +416,10 @@ def _store_batch(
         seen.add(result.arxiv_id)
         if result.mentions is None:
             counter["failed"] += 1
-            # A request the API errored, expired or canceled has no tokens (see
-            # result_from_batch_entry); an answer that was paid for has some. Only the
-            # second counts toward giving up on the paper.
-            outcome = "invalid" if result.input_tokens + result.output_tokens else "unanswered"
+            # Only a paid answer not in the schema ("invalid") and a request the API
+            # rejects ("errored") count toward giving up; expired and canceled ones say
+            # nothing about the paper.
+            outcome = result.unanswered or "invalid"
         elif current.get(result.arxiv_id) != sent[result.arxiv_id]:
             # The abstract changed after the send; a batch sent for the newer one may be
             # stored already, and this answer must not replace it.
@@ -424,9 +429,11 @@ def _store_batch(
             counter["extracted"] += 1
             counter["mentions"] += _store(connection, run_id, sent[result.arxiv_id], result)
             outcome = "extracted"
-        connection.execute(
+        outcomes.append((outcome, batch_id, result.arxiv_id))
+    with connection.cursor() as cursor:
+        cursor.executemany(
             "UPDATE extraction_batch_paper SET outcome = %s WHERE batch_id = %s AND arxiv_id = %s",
-            (outcome, batch_id, result.arxiv_id),
+            outcomes,
         )
     connection.execute(
         """
@@ -511,7 +518,7 @@ _REFUSED_BEFORE_CREATING = frozenset({400, 401, 403, 404, 409, 413, 422, 429})
 
 
 def _custom_id(arxiv_id: str) -> str:
-    if not ARXIV_ID.fullmatch(arxiv_id):
+    if not _ARXIV_ID.fullmatch(arxiv_id):
         raise BatchRejected(f"cannot send arXiv id {arxiv_id!r}: not a new-style id")
     return arxiv_id.replace(".", "_")
 
@@ -524,7 +531,9 @@ def result_from_batch_entry(entry: Any) -> ExtractionResult:
     out, it would make the whole batch look cut off.
     """
     if entry.result.type != "succeeded":
-        return ExtractionResult(entry.custom_id.replace("_", "."), None, 0, 0)
+        return ExtractionResult(
+            entry.custom_id.replace("_", "."), None, 0, 0, unanswered=entry.result.type
+        )
     message = entry.result.message
     text = next((block.text for block in message.content if block.type == "text"), None)
     try:

@@ -436,7 +436,9 @@ def test_batch_entry_that_was_not_answered_is_a_result_without_mentions_and_toke
     # It must be in the stream, or the batch would look cut off (see "incomplete").
     entry = batch_entry(result_type)
     entry.custom_id = "2511_00001"
-    assert extraction.result_from_batch_entry(entry) == ExtractionResult("2511.00001", None, 0, 0)
+    assert extraction.result_from_batch_entry(entry) == ExtractionResult(
+        "2511.00001", None, 0, 0, unanswered=result_type
+    )
 
 
 def advisory_locks(connection):
@@ -1003,13 +1005,13 @@ def test_collect_records_what_became_of_each_paper(connection):
     model = FakeModel(
         LORA_ANSWER,
         ExtractionResult(SURVEY.arxiv_id, None, 90, 5),
-        ExtractionResult(unanswered.arxiv_id, None, 0, 0),
+        ExtractionResult(unanswered.arxiv_id, None, 0, 0, unanswered="expired"),
     )
     run_batch(connection, model, new_run(connection), LORA, SURVEY, unanswered)
     assert outcomes(connection) == {
         LORA.arxiv_id: "extracted",
         SURVEY.arxiv_id: "invalid",
-        unanswered.arxiv_id: "unanswered",
+        unanswered.arxiv_id: "expired",
     }
 
 
@@ -1034,9 +1036,18 @@ def test_submit_does_not_send_a_paper_the_run_gave_up_on(connection):
     assert submit(connection, model, new_run(connection), [LORA.arxiv_id]) is not None
 
 
-def test_failed_requests_of_the_api_do_not_make_submit_give_up(connection):
+def test_a_request_that_always_errors_makes_submit_give_up(connection):
     add_papers(connection, LORA)
-    model = FakeModel(ExtractionResult(LORA.arxiv_id, None, 0, 0))
+    model = FakeModel(ExtractionResult(LORA.arxiv_id, None, 0, 0, unanswered="errored"))
+    run_id = new_run(connection)
+    for _ in range(EXTRACTION_MAX_ATTEMPTS):
+        run_batch(connection, model, run_id, LORA)
+    assert submit(connection, model, run_id, [LORA.arxiv_id]) is None
+
+
+def test_expired_requests_do_not_make_submit_give_up(connection):
+    add_papers(connection, LORA)
+    model = FakeModel(ExtractionResult(LORA.arxiv_id, None, 0, 0, unanswered="expired"))
     run_id = new_run(connection)
     for _ in range(EXTRACTION_MAX_ATTEMPTS):
         run_batch(connection, model, run_id, LORA)
