@@ -169,9 +169,10 @@ def collect_candidates(connection: psycopg.Connection) -> Candidates:
 
     An abbreviation is covered, and left out, when it and all its readings in the corpus are
     dictionary keys under one canonical name. Otherwise it is a candidate when it has one
-    reading and neither key is a dictionary key or a key of an abbreviation shown by hand.
-    Everything else is shown by hand in ``conflicts``, with the dictionary's names for its keys
-    at 0 papers. So no candidate key is a dictionary key.
+    reading, its key is no other abbreviation's reading, and neither key is a dictionary key or
+    a key of an abbreviation shown by hand. Everything else is shown by hand in ``conflicts``,
+    with the dictionary's names for its keys at 0 papers. So no candidate key is a dictionary
+    key, and candidates share keys only through a common reading.
     """
     known = dict(connection.execute("SELECT normal_form, canonical_name FROM synonym"))
     # abbreviation normal form -> expansion normal form -> spelling -> papers
@@ -188,6 +189,7 @@ def collect_candidates(connection: psycopg.Connection) -> Candidates:
                     spellings[key[0]][key[1]][pair.expansion] += 1
 
     keys = {key: {key, *expansions} for key, expansions in spellings.items()}
+    expansion_keys = {e for expansions in spellings.values() for e in expansions}
     covered = {
         key
         for key, group in keys.items()
@@ -200,6 +202,8 @@ def collect_candidates(connection: psycopg.Connection) -> Candidates:
         and (
             len(spellings[key]) > 1
             or not group.isdisjoint(known)
+            # "Lo-RA" is "lo ra", which may be the expansion of another abbreviation ("LR").
+            or key in expansion_keys
             or any(k != normal_form(k) for k in group)
         )
     }

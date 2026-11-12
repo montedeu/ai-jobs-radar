@@ -534,21 +534,30 @@ def test_pair_whose_keys_were_written_under_two_names_is_left_out(tmp_path):
 def transfer(database_url, tmp_path, dictionary, abstracts):
     """Collect against ``dictionary``, append every candidate row to it, load the result.
 
-    Returns the merged dictionary as ``read_synonyms`` reads it, which raises on a repeated key.
+    Returns the merged dictionary as ``read_synonyms`` reads it, which raises on a repeated key,
+    after checking that the rows rename no dictionary key and that any pair in the corpus whose
+    two keys both got a row has one name for both.
     """
     candidates = collect(database_url, abstracts, synonyms=dictionary)
     path = tmp_path / "candidates.csv"
     write_candidates_csv(candidates, path)
+    rows = [row[:2] for row in read_rows(path)[1:]]
     merged_file = tmp_path / "synonyms.csv"
     with merged_file.open("w", encoding="utf-8", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["normal_form", "canonical_name"])
         writer.writerows(dictionary)
-        writer.writerows(row[:2] for row in read_rows(path)[1:])
+        writer.writerows(rows)
     merged = read_synonyms(merged_file)
     with psycopg.connect(database_url) as connection:
         load_synonyms(connection, merged_file)
     assert {key: merged[key] for key, _ in dictionary} == dict(dictionary)
+    written = {key for key, _ in rows}
+    for abstract in abstracts:
+        for pair in find_pairs(abstract):
+            keys = {normal_form(pair.abbreviation), normal_form(pair.expansion)}
+            if keys <= written:
+                assert len({merged[key] for key in keys}) == 1, pair
     return candidates, merged
 
 
@@ -621,6 +630,16 @@ def test_candidate_rows_moved_over_the_dictionary_keep_it_whole(database_url, tm
     assert "nlproc" not in merged
 
 
+def test_abbreviation_that_is_another_ones_expansion_is_not_a_candidate(database_url, tmp_path):
+    abstracts = ["Lo Ra (LR)"] * 2 + ["low rank adaptation (LRAd)"] * 2
+    abstracts += ["Lo-RA (low rank adaptation)"]
+
+    candidates, merged = transfer(database_url, tmp_path, [], abstracts)
+
+    assert candidates.pairs == {}
+    assert set(candidates.conflicts) == {"lo ra", "lr", "lrad"}
+
+
 def test_candidate_rows_from_any_corpus_load_over_the_dictionary(database_url, tmp_path):
     phrases = [
         "Low-Rank Adaptation (LoRA)",
@@ -636,6 +655,8 @@ def test_candidate_rows_from_any_corpus_load_over_the_dictionary(database_url, t
         "Low-Precision (LP)",
         "İstanbul Speech Corpus (ISC)",
         "Speech Corpus (SC)",
+        "Lo Ra (LR)",
+        "Lo-RA (low rank adaptation)",
         "(see Section 3)",
         "((",
         "))",
