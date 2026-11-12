@@ -5,6 +5,7 @@ recompute history: it sends only the papers the current run has not done with th
 present abstract (docs/adr/0003).
 """
 
+import os
 from collections import Counter
 from collections.abc import Callable
 from typing import Any
@@ -13,8 +14,12 @@ import psycopg
 
 from research_radar import extraction, runs
 from research_radar.database import connect, database_url, direct_url, require_direct
-from research_radar.job_log import record_run
-from research_radar.settings import EXTRACTION_DAILY_MAX_PAPERS, EXTRACTION_MAX_ATTEMPTS
+from research_radar.job_log import RunSkipped, record_run
+from research_radar.settings import (
+    EXTRACTION_BATCH_SIZE,
+    EXTRACTION_DAILY_MAX_PAPERS,
+    EXTRACTION_MAX_ATTEMPTS,
+)
 
 
 class TooManyPapers(Exception):
@@ -57,6 +62,71 @@ def _due(connection: psycopg.Connection, run_id: int) -> tuple[list[str], int]:
     )
 
 
+class _LazyClient:
+    """Builds the model client on first use: a day with nothing to collect or send must not
+    need the key (the client's constructor reads it)."""
+
+    def __init__(self, factory: Callable[[], extraction.ModelClient]) -> None:
+        self._factory = factory
+        self._client: extraction.ModelClient | None = None
+
+    def resolve(self) -> extraction.ModelClient:
+        if self._client is None:
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise RunSkipped("ключ Anthropic не подключён к задаче (#22)")
+            self._client = self._factory()
+        return self._client
+
+    def __getattr__(self, name: str):
+        return getattr(self.resolve(), name)
+
+
+def _collect_all(
+    connection: psycopg.Connection, client: _LazyClient, details: dict[str, Any]
+) -> None:
+    """Collects every batch that is out, whatever run it belongs to; one that fails is
+    recorded in details["batch_errors"] and does not stop the others."""
+    collected: Counter = Counter()
+    ended = 0
+    errors: dict[str, str] = {}
+    try:
+        for (batch_id,) in connection.execute(
+            "SELECT id FROM extraction_batch WHERE status IN ('sending', 'submitted') ORDER BY id"
+        ).fetchall():
+            try:
+                counts = extraction.collect(connection, client, batch_id)
+            except RunSkipped:
+                raise
+            except Exception as error:
+                errors[str(batch_id)] = f"{type(error).__name__}: {error}"
+                continue
+            collected += counts
+            ended += any(counts[key] for key in ("extracted", "failed", "stale"))
+    finally:
+        details["collected"] = dict(collected)
+        details["batches_collected"] = ended
+        details["batch_errors"] = errors
+
+
+def _submit_all(
+    connection: psycopg.Connection, client: _LazyClient, run_id: int, due: list[str], details: dict
+) -> None:
+    parts = [due[i : i + EXTRACTION_BATCH_SIZE] for i in range(0, len(due), EXTRACTION_BATCH_SIZE)]
+    for index, part in enumerate(parts):
+        try:
+            batch_id = extraction.submit(connection, client, run_id, part)
+        except extraction.BudgetExceeded as error:
+            if not details["submitted_batches"]:
+                raise
+            sent = len(details["submitted_batches"])
+            raise extraction.BudgetExceeded(
+                f"sent {sent} parts, {len(parts) - index} left: {error}"
+            ) from error
+        if batch_id is not None:
+            details["submitted_batches"].append(batch_id)
+            details["submitted"] += len(part)
+
+
 def extract_daily(
     connection: psycopg.Connection,
     client_factory: Callable[[], extraction.ModelClient],
@@ -68,60 +138,39 @@ def extract_daily(
 
     ``details`` is filled step by step, so a caller that keeps the dict (the job log) still
     has what was done when a later step raises. The connection must have no transaction
-    open. The model client is made only when there is a batch to collect or a paper to send.
+    open. The model client is made only when there is a batch to collect or a paper to send,
+    and without a key that is RunSkipped. A batch that cannot be collected does not stop the
+    rest; the step then ends with an error naming it, after the papers were sent.
     """
     details = {} if details is None else details
-    client: extraction.ModelClient | None = None
-
-    def get_client() -> extraction.ModelClient:
-        nonlocal client
-        client = client or client_factory()
-        return client
-
-    batches = connection.execute(
-        "SELECT id, status FROM extraction_batch WHERE status IN ('sending', 'submitted')"
-        " ORDER BY id"
-    ).fetchall()
-    collected: Counter = Counter()
-    details["collected"] = {}
-    details["batches_collected"] = 0
-    for batch_id, status in batches:
-        if status == "sending":
-            # Nobody knows whether it left; collect would only count it, so no client is made.
-            collected["unsent"] += connection.execute(
-                "SELECT count(*) FROM extraction_batch_paper WHERE batch_id = %s", (batch_id,)
-            ).fetchone()[0]
-            continue
-        collected += extraction.collect(connection, get_client(), batch_id)
-        details["batches_collected"] += 1
-        details["collected"] = dict(collected)
-    details["collected"] = dict(collected)
-    details["spent_usd"] = str(extraction.spent_usd(connection))
-
-    details["promoted"] = runs.promote(connection)
-    run_id = runs.current_run(connection)
-    details["current_run"] = run_id
-    details.update(due=0, gave_up=0, submitted=0, submitted_batch=None)
-    if run_id is None:
-        return details
-
-    due, details["gave_up"] = _due(connection, run_id)
-    details["due"] = len(due)
-    if len(due) > max_papers:
-        raise TooManyPapers(
-            f"{len(due)} papers are due, the limit is {max_papers}; if the full run was "
-            "just switched to, run the job once with --max-extract-papers"
-        )
-    if not due:
-        return details
-
-    batch_id = extraction.submit(connection, get_client(), run_id, due)
-    details["submitted_batch"] = batch_id
-    if batch_id is not None:
-        details["submitted"] = connection.execute(
-            "SELECT count(*) FROM extraction_batch_paper WHERE batch_id = %s", (batch_id,)
-        ).fetchone()[0]
-    details["spent_usd"] = str(extraction.spent_usd(connection))
+    details.update(
+        promoted=None,
+        current_run=None,
+        due=0,
+        gave_up=0,
+        submitted=0,
+        submitted_batches=[],
+    )
+    client = _LazyClient(client_factory)
+    try:
+        _collect_all(connection, client, details)
+        details["promoted"] = runs.promote(connection)
+        run_id = details["current_run"] = runs.current_run(connection)
+        if run_id is not None:
+            due, details["gave_up"] = _due(connection, run_id)
+            details["due"] = len(due)
+            if len(due) > max_papers:
+                raise TooManyPapers(
+                    f"{len(due)} papers are due, the limit is {max_papers}; if the full run "
+                    "was just switched to, run the job once with --max-extract-papers"
+                )
+            if due:
+                client.resolve()
+                _submit_all(connection, client, run_id, due, details)
+    finally:
+        details["spent_usd"] = str(extraction.spent_usd(connection))
+    if details["batch_errors"]:
+        raise RuntimeError(f"batches not collected: {details['batch_errors']}")
     return details
 
 

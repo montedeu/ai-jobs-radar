@@ -4,10 +4,20 @@ from fakes import FakeModel
 
 from research_radar import cli, collect, daily_extraction, extraction, runs
 from research_radar.daily_extraction import TooManyPapers, extract_daily
-from research_radar.extraction import ExtractionResult, RunConfigMismatch, start_run
+from research_radar.extraction import (
+    BudgetExceeded,
+    ExtractionResult,
+    RunConfigMismatch,
+    start_run,
+)
 from research_radar.mentions import PaperMentions
 from research_radar.papers import abstract_hash
 from research_radar.settings import EXTRACTION_MAX_ATTEMPTS, EXTRACTION_MODEL
+
+
+@pytest.fixture(autouse=True)
+def api_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
 
 @pytest.fixture
@@ -101,7 +111,7 @@ def test_without_current_run_nothing_is_sent_and_no_client_is_created(connection
     details = extract_daily(connection, make)
 
     assert make.calls == []
-    assert (details["current_run"], details["due"], details["submitted_batch"]) == (None, 0, None)
+    assert (details["current_run"], details["due"], details["submitted_batches"]) == (None, 0, [])
 
 
 def test_new_paper_is_sent_with_the_current_run(connection, current):
@@ -112,7 +122,7 @@ def test_new_paper_is_sent_with_the_current_run(connection, current):
     assert sorted(r.arxiv_id for r in model.sent[0]) == ["2511.00002", "2511.00003"]
     assert details["due"] == 2
     batch_run = connection.execute(
-        "SELECT run_id FROM extraction_batch WHERE id = %s", (details["submitted_batch"],)
+        "SELECT run_id FROM extraction_batch WHERE id = %s", (details["submitted_batches"][0],)
     ).fetchone()[0]
     assert batch_run == current
 
@@ -141,7 +151,7 @@ def test_paper_in_flight_is_not_sent_again(connection, current):
 
     assert len(model.sent) == 1
     assert details["due"] == 0
-    assert details["batches_collected"] == 1
+    assert details["batches_collected"] == 0
     assert details["collected"] == {"pending": 2}
 
 
@@ -353,3 +363,107 @@ def test_daily_command_runs_collection_when_extraction_fails(
         ("collect", "succeeded"),
         ("extract", "failed"),
     ]
+
+
+def test_without_a_key_the_step_is_skipped_when_there_is_work(
+    database_url, connection, current, monkeypatch
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    make = factory(FakeModel())
+
+    daily_extraction.run(database_url, make)
+
+    assert make.calls == []
+    (row,) = [r for r in job_rows(connection) if r[0] == "extract"]
+    assert row[1] == "skipped"
+    assert "#22" in row[2]["skipped"]
+    assert row[2]["collected"] == {}
+    assert row[2]["due"] == 2
+
+
+def test_without_a_key_and_without_work_the_step_succeeds(database_url, connection, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+
+    daily_extraction.run(database_url, factory(FakeModel()))
+
+    assert [(r[0], r[1]) for r in job_rows(connection)] == [("extract", "succeeded")]
+
+
+def test_daily_command_exits_cleanly_when_the_key_is_missing(
+    database_url, connection, current, fake_arxiv, monkeypatch
+):
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.setattr(collect, "ArxivClient", lambda: fake_arxiv)
+
+    cli.main(["daily"])
+
+    assert [(r[0], r[1]) for r in job_rows(connection)] == [
+        ("collect", "succeeded"),
+        ("extract", "skipped"),
+    ]
+
+
+class FailingFirstBatch(FakeModel):
+    def batch_results(self, batch_id):
+        if batch_id == "batch-1":
+            raise RuntimeError("404: results expired")
+        return super().batch_results(batch_id)
+
+
+def test_a_broken_batch_does_not_stop_the_others_or_the_switch(connection, current):
+    add_paper(connection, "2511.00004", "full")
+    full = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    model = FailingFirstBatch(*[answer(f"2511.0000{n}") for n in range(1, 5)])
+    broken = extraction.submit(connection, model, full, ["2511.00001"])
+    extraction.submit(connection, model, full, ["2511.00002"])
+    for arxiv_id, abstract in (
+        ("2511.00001", "same"),
+        ("2511.00003", "new"),
+        ("2511.00004", "full"),
+    ):
+        mark_done(connection, full, arxiv_id, abstract)
+    details = {}
+
+    with pytest.raises(RuntimeError, match="not collected"):
+        extract_daily(connection, factory(model), details=details)
+
+    assert list(details["batch_errors"]) == [str(broken)]
+    assert "results expired" in details["batch_errors"][str(broken)]
+    assert details["batches_collected"] == 1
+    assert details["promoted"] == full
+    # The papers were still sent, after the switch, to the new current run.
+    assert details["current_run"] == full
+
+
+def test_due_papers_go_in_parts_of_the_batch_size(connection, current, monkeypatch):
+    monkeypatch.setattr(daily_extraction, "EXTRACTION_BATCH_SIZE", 1)
+    model = FakeModel()
+
+    details = extract_daily(connection, factory(model))
+
+    assert len(model.sent) == 2
+    assert len(details["submitted_batches"]) == 2
+    assert details["submitted"] == 2
+
+
+def test_budget_after_a_sent_part_stops_sending_and_says_how_much_is_left(
+    connection, current, monkeypatch
+):
+    monkeypatch.setattr(daily_extraction, "EXTRACTION_BATCH_SIZE", 1)
+    real = extraction.submit
+    calls = []
+
+    def second_part_over_budget(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 2:
+            raise BudgetExceeded("over the ceiling")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(extraction, "submit", second_part_over_budget)
+    details = {}
+
+    with pytest.raises(BudgetExceeded, match="sent 1 parts, 1 left"):
+        extract_daily(connection, factory(FakeModel()), details=details)
+
+    assert details["submitted"] == 1

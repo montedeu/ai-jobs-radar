@@ -35,6 +35,12 @@ def main(argv: list[str] | None = None) -> None:
         help="the limit on papers read in this run; raise it after the job was down for long",
     )
     parsers["daily"].add_argument(
+        "--max-papers",
+        type=_positive,
+        help="the limit on papers read by the collection step; raise it after the job was "
+        "down for long",
+    )
+    parsers["daily"].add_argument(
         "--max-extract-papers",
         type=_positive,
         help="the limit on papers sent to extraction in this run; raise it after a full run "
@@ -83,7 +89,7 @@ def main(argv: list[str] | None = None) -> None:
         # not keep the other from running.
         failed = False
         steps = (
-            lambda: collect.run(),
+            lambda: collect.run(max_papers=args.max_papers),
             lambda: daily_extraction.run(
                 client_factory=extraction.AnthropicModelClient,
                 max_papers=args.max_extract_papers or EXTRACTION_DAILY_MAX_PAPERS,

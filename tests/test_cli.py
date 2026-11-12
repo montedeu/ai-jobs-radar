@@ -45,9 +45,19 @@ def test_daily_runs_collection_then_extraction_with_the_raised_limit(monkeypatch
         daily_extraction, "run", lambda **kwargs: order.append(("extract", kwargs["max_papers"]))
     )
 
-    cli.main(["daily", "--max-extract-papers", "900"])
+    cli.main(["daily", "--max-extract-papers", "900", "--max-papers", "20000"])
 
-    assert order == [("collect", {}), ("extract", 900)]
+    assert order == [("collect", {"max_papers": 20000}), ("extract", 900)]
+
+
+def test_daily_without_max_papers_keeps_the_collect_default(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(collect, "run", lambda **kwargs: seen.update(kwargs))
+    monkeypatch.setattr(daily_extraction, "run", lambda **kwargs: None)
+
+    cli.main(["daily"])
+
+    assert seen == {"max_papers": None}
 
 
 def test_daily_without_the_flag_keeps_the_default_extraction_limit(monkeypatch):
