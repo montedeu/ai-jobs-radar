@@ -71,8 +71,13 @@ class FullRunPlan:
 
 
 _RESTART_HINT = (
-    "Sort out the batches stuck in 'sending', or run again with --confirm --restart: "
-    "that starts a new full run, which is newer, so the old one never becomes current."
+    "Run again with --confirm --restart to start a new full run: it is newer, so the old "
+    "one never becomes current."
+)
+_ABANDON_HINT = (
+    "First check the Anthropic console for a batch that was created: the cost of a batch "
+    "given up stays in the spent total. Then run with --confirm --abandon-sending to give "
+    "the sending batches up and continue, or with --confirm --restart for a new full run."
 )
 
 
@@ -124,57 +129,60 @@ def _prepare(
         return found, list(ids)
 
     pinned = extraction.config_hash(config, model)
-    current = runs.current_run(connection)
-    if current is not None and not restart:
-        same = connection.execute(
-            "SELECT model = %s AND prompt_hash = %s FROM extraction_run WHERE id = %s",
-            (model, pinned, current),
-        ).fetchone()[0]
-        if same:
+    head = None if restart else runs.head_candidate(connection)
+    if head is not None:
+        return _plan_head(connection, result, head, model, pinned)
+    if not restart:
+        current = runs.current_run(connection)
+        if current is not None and _same_request(connection, current, model, pinned):
             # Another start would pay for the whole history again.
             return result(ALREADY_CURRENT)
-    head = None if restart else runs.head_candidate(connection)
-    if head is None:
-        scope = sorted(
-            r[0] for r in connection.execute(extraction.SCOPE_SQL, extraction.SCOPE_PARAMS)
-        )
-        if not scope:
-            return result(EMPTY_HISTORY)
-        return result(READY, scope, scope=len(scope))
-    run_model, run_hash = connection.execute(
-        "SELECT model, prompt_hash FROM extraction_run WHERE id = %s", (head,)
-    ).fetchone()
-    if (run_model, run_hash) != (model, pinned):
+    scope = sorted(r[0] for r in connection.execute(extraction.SCOPE_SQL, extraction.SCOPE_PARAMS))
+    if not scope:
+        return result(EMPTY_HISTORY)
+    return result(READY, scope, scope=len(scope))
+
+
+def _same_request(connection: psycopg.Connection, run_id: int, model: str, pinned: str) -> bool:
+    return connection.execute(
+        "SELECT model = %s AND prompt_hash = %s FROM extraction_run WHERE id = %s",
+        (model, pinned, run_id),
+    ).fetchone()[0]
+
+
+def _plan_head(connection, result, head: int, model: str, pinned: str):
+    if not _same_request(connection, head, model, pinned):
         # Paying for an older run is pointless: the head is newer, and promote never
         # switches to a run older than the current one.
         return result(NEWER_RUN_OTHER_CONFIG, other_run=head)
     state = runs.run_state(connection, head)
-    in_flight, sending = _in_flight(connection, head)
+    in_flight = {r[0] for r in connection.execute(extraction.IN_FLIGHT_SQL, {"run": head})}
     fields = {
         "run_id": head,
         "in_flight": len(in_flight),
         "given_up": state.given_up,
         "scope": state.scope,
-        "sending": sending,
+        "sending": _sending(connection, head),
     }
-    if sending:
-        # A batch in 'sending' may or may not have left; more parts on top of it could pay
-        # twice for what it carries.
-        return result(STUCK_SENDING, **fields)
     if state.blocked:
         # Whatever is still missing, the run will not become current: sending more is wasted.
         return result(BLOCKED, **fields)
+    if fields["sending"]:
+        # A batch in 'sending' may or may not have left; more parts on top of it could pay
+        # twice for what it carries.
+        return result(STUCK_SENDING, **fields)
     to_send = [i for i in runs.missing_papers(connection, head) if i not in in_flight]
     if to_send:
         return result(READY, to_send, **fields)
     return result(NOTHING_TO_SEND, **fields)
 
 
-def _in_flight(connection: psycopg.Connection, run_id: int) -> tuple[set[str], int]:
-    """The papers the run has in an uncollected batch, and how many of its batches are
-    stuck in 'sending'."""
-    rows = connection.execute(extraction.IN_FLIGHT_SQL, {"run": run_id}).fetchall()
-    return {row[0] for row in rows}, len({row[2] for row in rows if row[3] == "sending"})
+def _sending(connection: psycopg.Connection, run_id: int) -> int:
+    """How many of the run's batches are stuck in 'sending'."""
+    return connection.execute(
+        "SELECT count(*) FROM extraction_batch WHERE run_id = %s AND status = 'sending'",
+        (run_id,),
+    ).fetchone()[0]
 
 
 def _requests(connection: psycopg.Connection, ids: list[str]) -> list[ExtractionRequest]:
@@ -195,6 +203,7 @@ def run(
     config: RequestConfig = DEFAULT_CONFIG,
     confirm: bool,
     restart: bool = False,
+    abandon_sending: bool = False,
     out: Callable[[str], None] = print,
 ) -> FullRunPlan:
     """Prints the plan; with confirm, creates or continues the run and sends it in parts.
@@ -204,9 +213,15 @@ def run(
     collected the parts sent. A stop before the first part raises BudgetExceeded.
     """
     database.require_direct(connection)
+    if not connection.autocommit:
+        # With a transaction open the extraction steps refuse to run, after the plan has
+        # already counted tokens; better to fail before it.
+        raise ValueError("the connection must be in autocommit mode")
     extraction.require_idle(connection)
-    if restart and not confirm:
-        raise ValueError("restart needs confirm")
+    if (restart or abandon_sending) and not confirm:
+        raise ValueError("restart and abandon_sending need confirm")
+    if restart and abandon_sending:
+        raise ValueError("restart and abandon_sending exclude each other")
     if not connection.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (LOCK_KEY,)).fetchone()[
         0
     ]:
@@ -215,7 +230,9 @@ def run(
             None, 0, 0, Decimal(0), Decimal(0), EXTRACTION_CEILING_USD, status=LOCKED
         )
     try:
-        return _run_locked(connection, client, model, config, confirm, restart, out)
+        return _run_locked(
+            connection, client, model, config, confirm, restart, abandon_sending, out
+        )
     finally:
         # A broken connection took the lock with it; failing here would hide the error
         # that broke it.
@@ -233,8 +250,11 @@ def _run_locked(
     config: RequestConfig,
     confirm: bool,
     restart: bool,
+    abandon_sending: bool,
     out: Callable[[str], None],
 ) -> FullRunPlan:
+    if abandon_sending:
+        _abandon_sending(connection, model, config, out)
     found, ids = _prepare(connection, client, model, config, restart)
     _print_plan(found, out)
     if found.status != READY:
@@ -248,6 +268,7 @@ def _run_locked(
     if found.run_id is None:
         run_id = extraction.start_run(connection, model=model, config=config, full=True)
         out(f"Created full run {run_id}.")
+        found = replace(found, run_id=run_id)
         # The snapshot is taken now, so papers collected since the plan are in it.
         ids = runs.missing_papers(connection, run_id)
     else:
@@ -259,8 +280,8 @@ def _run_locked(
     for index, part in enumerate(parts):
         stop = _stop_before_part(connection, run_id)
         if stop is not None:
-            _print_stop(found, stop, run_id, sent, skipped, len(parts) - index, out)
-            return replace(found, status=stop, run_id=run_id)
+            _print_stop(stop, run_id, sent, skipped, len(parts) - index, out)
+            return replace(found, status=stop)
         try:
             if extraction.submit(connection, client, run_id, part) is None:
                 skipped += 1
@@ -288,18 +309,38 @@ def _run_locked(
     return found
 
 
+def _abandon_sending(
+    connection: psycopg.Connection, model: str, config: RequestConfig, out: Callable[[str], None]
+) -> None:
+    """Gives up the head run's batches left in 'sending', when the head is this request's."""
+    head = runs.head_candidate(connection)
+    if head is None or not _same_request(
+        connection, head, model, extraction.config_hash(config, model)
+    ):
+        return
+    given_up = connection.execute(
+        "UPDATE extraction_batch SET status = 'abandoned'"
+        " WHERE run_id = %s AND status = 'sending' RETURNING id",
+        (head,),
+    ).fetchall()
+    if given_up:
+        out(
+            f"Abandoned {len(given_up)} batches of run {head} left in 'sending'; their cost "
+            "stays in the spent total."
+        )
+
+
 def _stop_before_part(connection: psycopg.Connection, run_id: int) -> str | None:
     """Why no further part may be sent: what was true at the plan can change under a long
     send (a collected batch can push the run over the limit, a send can be left hanging)."""
-    if _in_flight(connection, run_id)[1]:
-        return STUCK_SENDING
     if runs.run_state(connection, run_id).blocked:
         return BLOCKED
+    if _sending(connection, run_id):
+        return STUCK_SENDING
     return None
 
 
 def _print_stop(
-    found: FullRunPlan,
     stop: str,
     run_id: int,
     sent: int,
@@ -307,12 +348,16 @@ def _print_stop(
     left: int,
     out: Callable[[str], None],
 ) -> None:
-    why = (
-        "a batch of the run is stuck in 'sending'"
-        if stop == STUCK_SENDING
-        else "the run gave up on too many papers and will not become current"
-    )
-    out(f"Stopped before the next part of run {run_id}: {why}. {_RESTART_HINT}")
+    if stop == BLOCKED:
+        out(
+            f"Stopped before the next part of run {run_id}: it gave up on too many papers "
+            f"and will not become current. {_RESTART_HINT}"
+        )
+    else:
+        out(
+            f"Stopped before the next part of run {run_id}: a batch is stuck in 'sending'. "
+            f"{_ABANDON_HINT}"
+        )
     out(f"Sent {sent}, skipped {skipped}, left {left}.")
 
 
@@ -338,14 +383,17 @@ def _print_plan(found: FullRunPlan, out: Callable[[str], None]) -> None:
     if found.status == STUCK_SENDING:
         out(
             f"The run {found.run_id} has {found.sending} batches stuck in 'sending': they may "
-            f"or may not have left, so nothing more is sent. {_RESTART_HINT}"
+            f"or may not have left, so nothing more is sent. {_ABANDON_HINT}"
         )
         return
     if found.status == BLOCKED:
         out(
             f"The run {found.run_id} gave up on {found.given_up} of {found.scope} papers, "
-            f"so it will not become current; nothing is sent. {_RESTART_HINT}"
+            f"so it will not become current; nothing is sent. Look at the papers it gave up "
+            f"on. {_RESTART_HINT}"
         )
+        if found.sending:
+            out(f"It also has {found.sending} batches stuck in 'sending'. {_ABANDON_HINT}")
         return
     target = "a new run" if found.run_id is None else f"run {found.run_id}"
     out(

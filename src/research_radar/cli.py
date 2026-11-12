@@ -45,9 +45,18 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="with --confirm: start a new full run even if an unfinished one exists",
     )
+    parsers["full-run"].add_argument(
+        "--abandon-sending",
+        action="store_true",
+        help="with --confirm: give up the batches left in 'sending' (their cost stays in the "
+        "spent total) and continue",
+    )
     args = parser.parse_args(argv)
-    if args.command == "full-run" and args.restart and not args.confirm:
-        parser.error("--restart works only together with --confirm")
+    if args.command == "full-run":
+        if (args.restart or args.abandon_sending) and not args.confirm:
+            parser.error("--restart and --abandon-sending work only together with --confirm")
+        if args.restart and args.abandon_sending:
+            parser.error("--restart and --abandon-sending exclude each other")
 
     # Imported per command: a job does not pay for loading the web stack.
     if args.command == "migrate":
@@ -69,7 +78,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "frequencies":
         from research_radar import database, frequencies
 
-        with database.connect(database.direct_url(database.database_url())) as connection:
+        with database.connect() as connection:
             table = frequencies.top_entities(
                 connection, args.run, category=args.category, limit=args.limit
             )
@@ -91,6 +100,7 @@ def main(argv: list[str] | None = None) -> None:
                     model=EXTRACTION_MODEL,
                     confirm=args.confirm,
                     restart=args.restart,
+                    abandon_sending=args.abandon_sending,
                 )
             except extraction.BudgetExceeded as error:
                 raise SystemExit(f"error: {error}") from error

@@ -92,6 +92,7 @@ def go(
     config=DEFAULT_CONFIG,
     model=EXTRACTION_MODEL,
     restart=False,
+    abandon_sending=False,
 ):
     lines = []
     plan = full_run.run(
@@ -101,6 +102,7 @@ def go(
         config=config,
         confirm=confirm,
         restart=restart,
+        abandon_sending=abandon_sending,
         out=lines.append,
     )
     return plan, "\n".join(lines)
@@ -108,6 +110,10 @@ def go(
 
 def count(connection, table):
     return connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+
+def newest_run(connection):
+    return connection.execute("SELECT max(id) FROM extraction_run").fetchone()[0]
 
 
 def sent_ids(client):
@@ -272,7 +278,7 @@ def test_full_run_with_another_request_config_starts_a_new_run(connection, paper
 
     plan, _ = go(connection, client, config=OTHER_CONFIG)
 
-    assert plan.run_id is None
+    assert plan.run_id == newest_run(connection)
     assert count(connection, "extraction_run") == 2
     assert sent_ids(client) == IDS
     assert OTHER_CONFIG in client.configs
@@ -303,7 +309,7 @@ def test_run_older_than_the_current_one_is_not_continued(connection, papers):
 
     plan, _ = go(connection, client)
 
-    assert plan.run_id is None
+    assert plan.run_id == newest_run(connection)
     assert count(connection, "extraction_run") == 3
     created = connection.execute("SELECT max(id) FROM extraction_run").fetchone()[0]
     assert created not in (older, newer)
@@ -455,7 +461,7 @@ def test_restart_starts_a_new_run_past_the_head_of_the_queue(connection, papers)
 
     plan, _ = go(connection, client, restart=True)
 
-    assert plan.run_id is None
+    assert plan.run_id == newest_run(connection)
     assert count(connection, "extraction_run") == 2
     assert sent_ids(client) == IDS
     assert runs.head_candidate(connection) != run_id
@@ -555,7 +561,7 @@ def test_restart_beats_an_already_current_run(connection, papers):
 
     plan, _ = go(connection, client, restart=True)
 
-    assert plan.run_id is None
+    assert plan.run_id == newest_run(connection)
     assert count(connection, "extraction_run") == 2
     assert sent_ids(client) == IDS
 
@@ -653,3 +659,160 @@ def test_cli_connects_to_the_direct_address_of_a_pooled_url(
 
     assert len(asked) == 1
     assert "ep-a-1.x.neon.tech" in asked[0] and "pooler" not in asked[0]
+
+
+def test_restarted_run_stopped_at_the_ceiling_is_continued_by_the_next_plain_command(
+    connection, papers
+):
+    current = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    mark_done(connection, current, *IDS)
+    assert runs.promote(connection) == current
+    spent = spend(connection, EXTRACTION_CEILING_USD - part_cost(2) * Decimal("1.5"))
+    go(connection, PerPaperModel(), restart=True)
+    restarted = newest_run(connection)
+    runs_before = count(connection, "extraction_run")
+    connection.execute("UPDATE extraction_batch SET actual_cost_usd = 0 WHERE id = %s", (spent,))
+    client = PerPaperModel()
+
+    plan, _ = go(connection, client)
+
+    assert plan.run_id == restarted
+    assert count(connection, "extraction_run") == runs_before
+    assert sent_ids(client) == IDS[2:]
+
+
+def stuck_run(connection):
+    """A run whose second part was left in 'sending'; returns the run id."""
+    with pytest.raises(RuntimeError, match="connection lost"):
+        go(connection, FailsOnSecondSubmit())
+    return newest_run(connection)
+
+
+def test_abandoning_the_sending_batch_continues_the_run_and_keeps_its_cost(connection, papers):
+    run_id = stuck_run(connection)
+    before = extraction.spent_usd(connection)
+    client = PerPaperModel()
+
+    plan, text = go(connection, client, abandon_sending=True)
+
+    assert sent_ids(client) == IDS[2:]
+    assert plan.run_id == run_id
+    assert (
+        connection.execute(
+            "SELECT count(*) FROM extraction_batch WHERE run_id = %s AND status = 'abandoned'",
+            (run_id,),
+        ).fetchone()[0]
+        == 1
+    )
+    assert extraction.spent_usd(connection) >= before
+    assert "abandoned" in text.lower()
+
+
+def test_an_abandoned_batch_counts_as_spent_at_its_estimate(connection, papers):
+    run_id = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    connection.execute(
+        "INSERT INTO extraction_batch (run_id, status, estimated_cost_usd)"
+        " VALUES (%s, 'abandoned', 1.5)",
+        (run_id,),
+    )
+
+    assert extraction.spent_usd(connection) == Decimal("1.5")
+
+
+def test_collect_leaves_an_abandoned_batch_alone(connection, papers):
+    run_id = stuck_run(connection)
+    go(connection, PerPaperModel(), abandon_sending=True)
+    batch_id = connection.execute(
+        "SELECT id FROM extraction_batch WHERE run_id = %s AND status = 'abandoned'", (run_id,)
+    ).fetchone()[0]
+    client = PerPaperModel()
+
+    result = extraction.collect(connection, client, batch_id)
+
+    assert client.calls == []
+    assert result == {"abandoned": 2}
+    status = "SELECT status FROM extraction_batch WHERE id = %s"
+    assert connection.execute(status, (batch_id,)).fetchone()[0] == "abandoned"
+
+
+def test_abandon_sending_needs_confirm_and_excludes_restart(cli_client, papers, capsys):
+    for flags in (["--abandon-sending"], ["--confirm", "--abandon-sending", "--restart"]):
+        with pytest.raises(SystemExit) as stop:
+            cli.main(["full-run", *flags])
+        assert stop.value.code != 0
+
+
+def test_stuck_hint_names_the_abandon_flag_and_warns_about_the_console(connection, papers):
+    stuck_run(connection)
+
+    _, text = go(connection, PerPaperModel())
+
+    assert "--abandon-sending" in text
+    assert "console" in text
+    assert "stays in the spent" in text
+
+
+def test_blocked_and_stuck_run_reports_blocked_first(connection, papers):
+    run_id = stuck_run(connection)
+    for arxiv_id in IDS[:2]:
+        give_up_on(connection, run_id, arxiv_id)
+
+    plan, text = go(connection, PerPaperModel())
+
+    assert plan.status == full_run.BLOCKED
+    assert text.index("will not become current") < text.index("sending")
+    assert "--abandon-sending" in text
+
+
+def test_blocked_run_without_sending_batches_does_not_talk_about_sending(connection, papers):
+    run_id = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    for arxiv_id in IDS[:2]:
+        give_up_on(connection, run_id, arxiv_id)
+
+    _, text = go(connection, PerPaperModel())
+
+    assert "sending" not in text
+    assert "--restart" in text
+
+
+def test_sending_batches_are_counted_by_batch_not_by_paper_rows(connection, papers):
+    run_id = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    connection.execute(
+        "INSERT INTO extraction_batch (run_id, status, estimated_cost_usd)"
+        " VALUES (%s, 'sending', 0)",
+        (run_id,),
+    )
+
+    plan, _ = go(connection, PerPaperModel())
+
+    assert (plan.status, plan.sending) == (full_run.STUCK_SENDING, 1)
+
+
+def test_command_needs_an_autocommit_connection(database_url, papers):
+    with psycopg.connect(database_url) as plain:
+        client = PerPaperModel()
+
+        with pytest.raises(ValueError, match="autocommit"):
+            full_run.run(plain, client, model=EXTRACTION_MODEL, confirm=False)
+
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("host", "options"),
+    [
+        ("EP-Example-POOLER.eu-central-1.aws.neon.tech", ""),
+        ("db.example.com", "endpoint=ep-example-pooler"),
+    ],
+)
+def test_pooled_connection_is_recognised_in_any_case_and_in_options(
+    connection, monkeypatch, host, options
+):
+    class Pooled:
+        pass
+
+    Pooled.host, Pooled.options = host, options
+    monkeypatch.setattr(psycopg.Connection, "info", Pooled(), raising=False)
+
+    with pytest.raises(RuntimeError, match="direct URL"):
+        database.require_direct(connection)

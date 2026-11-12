@@ -442,7 +442,8 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
     """Stores a finished batch's answers.
 
     Counts "extracted", "mentions", "pending" (not ended yet), "unsent" (stuck in
-    'sending', for a person to sort out), "rejected" (the API refused the batch), "failed"
+    'sending', for a person to sort out), "abandoned" (a stuck batch a person gave up on:
+    never fetched), "rejected" (the API refused the batch), "failed"
     (the paper's request got no usable answer, or none at all because it errored, expired
     or was canceled: no completion mark, so the paper is due again), "stale" (the paper's
     abstract changed since the batch was sent, so the answer is dropped and the paper stays
@@ -467,8 +468,8 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
     status, provider_batch_id, papers = row
     if status == "collected":
         return Counter()
-    if status in ("sending", "rejected"):
-        return Counter({"unsent" if status == "sending" else "rejected": papers})
+    if status in ("sending", "rejected", "abandoned"):
+        return Counter({{"sending": "unsent"}.get(status, status): papers})
     if not client.batch_ended(provider_batch_id):
         return Counter(pending=papers)
     results = list(client.batch_results(provider_batch_id))
