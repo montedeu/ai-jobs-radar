@@ -34,6 +34,25 @@ class ServiceStatus(BaseModel):
     history_error: str | None = None
 
 
+class StatusUnavailable(Exception):
+    """The database cannot be reached. The message is the error type and SQLSTATE only."""
+
+
+def _error_summary(error: Exception) -> str:
+    # psycopg messages can name the database host and user, so only the type and SQLSTATE go out.
+    sqlstate = error.sqlstate if isinstance(error, psycopg.Error) else None
+    name = type(error).__name__
+    return f"{name} (SQLSTATE {sqlstate})" if sqlstate else name
+
+
+def _without_error_text(run: JobRun) -> JobRun:
+    # The job log keeps the full text for the developer; the answer names only the type.
+    error = run.details.get("error")
+    if not isinstance(error, str):
+        return run
+    return run.model_copy(update={"details": {**run.details, "error": error.split(":", 1)[0]}})
+
+
 @server.tool()
 def service_status() -> ServiceStatus:
     """When each scheduled job last ran and how it ended, and what the database holds.
@@ -43,17 +62,19 @@ def service_status() -> ServiceStatus:
     collected), and the days up to it without a paper. It also gives, once for the whole
     answer, when the daily collection last succeeded and the database size. If the summary
     cannot be read, `history` is empty and `history_error` says why; `latest_runs` stays.
+    If the database cannot be reached, the call fails with the error type and SQLSTATE.
     """
-    with connect() as connection:
-        runs = latest_runs(connection)
-        # Ends the transaction the read above began; the summary needs a fresh one.
-        connection.commit()
-        try:
-            return ServiceStatus(latest_runs=runs, history=history_summary(connection))
-        except psycopg.Error as error:
-            # The message can name the database host and user, so only the type and SQLSTATE go out.
-            code = f" (SQLSTATE {error.sqlstate})" if error.sqlstate else ""
-            return ServiceStatus(latest_runs=runs, history_error=f"{type(error).__name__}{code}")
+    try:
+        with connect() as connection:
+            runs = [_without_error_text(run) for run in latest_runs(connection)]
+            # Ends the transaction the read above began; the summary needs a fresh one.
+            connection.commit()
+            try:
+                return ServiceStatus(latest_runs=runs, history=history_summary(connection))
+            except Exception as error:
+                return ServiceStatus(latest_runs=runs, history_error=_error_summary(error))
+    except psycopg.Error as error:
+        raise StatusUnavailable(_error_summary(error)) from None
 
 
 @server.custom_route(HEALTH_PATH, methods=["GET"])

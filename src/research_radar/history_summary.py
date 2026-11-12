@@ -19,9 +19,9 @@ class SliceHistory(BaseModel):
     category: str
     backfilled_through: date | None
     updated_through: datetime | None
-    # Every day up to this one is collected: the later of the backfill boundary and the
-    # day before updated_through, whose own day the daily job has not closed yet. None
-    # until the backfill has set the boundary.
+    # Every day up to this one is collected: the backfill boundary, or the later of it and the
+    # day before updated_through once the last backfill succeeded. None until the backfill
+    # has set the boundary.
     collected_through: date | None
     months: list[MonthCount]
     empty_days: list[date]
@@ -66,7 +66,11 @@ def _slice_history(connection: psycopg.Connection, category: str) -> SliceHistor
         (category,),
     ).fetchone()
     backfilled_through, updated_through = state or (None, None)
-    collected_through = _collected_through(backfilled_through, updated_through)
+    last_backfill = connection.execute(
+        "SELECT status FROM job_run WHERE job = 'backfill' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    backfill_succeeded = last_backfill is not None and last_backfill[0] == "succeeded"
+    collected_through = _collected_through(backfilled_through, updated_through, backfill_succeeded)
     papers_per_day = dict(
         connection.execute(
             """
@@ -91,13 +95,15 @@ def _slice_history(connection: psycopg.Connection, category: str) -> SliceHistor
 
 
 def _collected_through(
-    backfilled_through: date | None, updated_through: datetime | None
+    backfilled_through: date | None, updated_through: datetime | None, backfill_succeeded: bool
 ) -> date | None:
     # Without a backfill boundary the history before the daily job's own reach is unknown,
     # so no day is claimed as collected.
     if backfilled_through is None:
         return None
-    if updated_through is None:
+    # The boundary moves day by day from the start, so it also stands after a backfill that
+    # stopped midway. The daily job's reach counts only once the last backfill succeeded.
+    if updated_through is None or not backfill_succeeded:
         return backfilled_through
     # arXiv time is UTC and the daily job rereads from a day before updated_through.
     closed = updated_through.astimezone(UTC).date() - timedelta(days=1)
