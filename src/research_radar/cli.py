@@ -8,6 +8,7 @@ from research_radar.frequencies import DEFAULT_CATEGORY, DEFAULT_LIMIT
 
 COMMANDS = {
     "migrate": "apply schema migrations up to the latest",
+    "load-synonyms": "load the synonym dictionary file into the database, recording a version",
     "collect": "store the papers arXiv published or revised since the last run",
     "daily": "collect, then collect the sent batches and send the new papers to extraction",
     "backfill": "store the history of every slice, resuming where it stopped",
@@ -77,6 +78,14 @@ def main(argv: list[str] | None = None) -> None:
         from research_radar import migrate
 
         migrate.upgrade()
+    elif args.command == "load-synonyms":
+        from research_radar import database, synonyms
+
+        # Like full-run, on the direct address: the load holds a lock for its transaction,
+        # and behind Neon's pooler a transaction is not the job's own.
+        with database.connect(database.direct_url(database.database_url())) as connection:
+            count = synonyms.load_synonyms(connection)
+        print(f"synonyms loaded: {count} entries")
     elif args.command == "collect":
         from research_radar import collect
 

@@ -83,6 +83,12 @@ jobs:
             --cpu 1 --memory 512Mi --quiet
           gcloud run jobs execute "$MIGRATE_JOB" --wait --quiet
 
+      # The synonym dictionary is a file in the image (ADR 0002); this writes it to the
+      # table and records a version when its content changed. After the migrations, which
+      # create the tables it writes, and on the same job: it has the image and the secret.
+      - name: Load the synonym dictionary
+        run: gcloud run jobs execute "$MIGRATE_JOB" --args load-synonyms --wait --quiet
+
       # The collect job connects differently from the server (its own address, a session
       # lock), so the server's smoke test says nothing about it. This runs the new image
       # as far as a collection job goes before its first request to arXiv, on the migrate
