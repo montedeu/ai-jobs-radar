@@ -291,7 +291,7 @@ def test_failed_history_summary_does_not_hide_the_latest_runs(
     result = response.json()["result"]["structuredContent"]
     assert [run["job"] for run in result["latest_runs"]] == ["collect"]
     assert result["history"] is None
-    assert result["history_error"] == "OperationalError: connection lost"
+    assert result["history_error"] == "OperationalError"
 
 
 def test_query_failing_inside_the_snapshot_reports_its_own_error(client, database_url, monkeypatch):
@@ -304,4 +304,32 @@ def test_query_failing_inside_the_snapshot_reports_its_own_error(client, databas
 
     result = response.json()["result"]["structuredContent"]
     assert result["history"] is None
-    assert result["history_error"].startswith("DivisionByZero:")
+    assert result["history_error"].startswith("DivisionByZero (SQLSTATE 22012")
+
+
+def test_history_error_has_no_error_text(client, monkeypatch):
+    def leaking(connection):
+        raise psycopg.errors.InvalidPassword("host=secret-host user=secret-user")
+
+    monkeypatch.setattr(mcp_server, "history_summary", leaking)
+
+    result = call(client, "tools/call", {"name": "service_status", "arguments": {}}).json()[
+        "result"
+    ]["structuredContent"]
+
+    assert "secret" not in result["history_error"]
+    assert result["history_error"] == "InvalidPassword (SQLSTATE 28P01)"
+
+
+def test_slice_collected_only_by_the_daily_job_has_no_collected_history(client, database_url):
+    with connect(database_url) as connection:
+        set_state(connection, "cs.CL", None, "2025-12-03T18:00Z")
+        add_paper(connection, "2511.00001", "2025-11-03", ["cs.CL"])
+        connection.commit()
+
+    found = cs_cl(status(client))
+
+    assert found["collected_through"] is None
+    assert found["empty_days"] == []
+    assert found["empty_day_count"] == 0
+    assert [m["partial"] for m in found["months"]] == [True]

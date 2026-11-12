@@ -51,7 +51,9 @@ def service_status() -> ServiceStatus:
         try:
             return ServiceStatus(latest_runs=runs, history=history_summary(connection))
         except psycopg.Error as error:
-            return ServiceStatus(latest_runs=runs, history_error=f"{type(error).__name__}: {error}")
+            # The message can name the database host and user, so only the type and SQLSTATE go out.
+            code = f" (SQLSTATE {error.sqlstate})" if error.sqlstate else ""
+            return ServiceStatus(latest_runs=runs, history_error=f"{type(error).__name__}{code}")
 
 
 @server.custom_route(HEALTH_PATH, methods=["GET"])

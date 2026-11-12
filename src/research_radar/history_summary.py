@@ -20,7 +20,8 @@ class SliceHistory(BaseModel):
     backfilled_through: date | None
     updated_through: datetime | None
     # Every day up to this one is collected: the later of the backfill boundary and the
-    # day before updated_through, whose own day the daily job has not closed yet.
+    # day before updated_through, whose own day the daily job has not closed yet. None
+    # until the backfill has set the boundary.
     collected_through: date | None
     months: list[MonthCount]
     empty_days: list[date]
@@ -89,10 +90,18 @@ def _slice_history(connection: psycopg.Connection, category: str) -> SliceHistor
     )
 
 
-def _collected_through(backfilled_through: date | None, updated_through: datetime | None):
+def _collected_through(
+    backfilled_through: date | None, updated_through: datetime | None
+) -> date | None:
+    # Without a backfill boundary the history before the daily job's own reach is unknown,
+    # so no day is claimed as collected.
+    if backfilled_through is None:
+        return None
+    if updated_through is None:
+        return backfilled_through
     # arXiv time is UTC and the daily job rereads from a day before updated_through.
-    closed = updated_through.astimezone(UTC).date() - timedelta(days=1) if updated_through else None
-    return max((day for day in (backfilled_through, closed) if day), default=None)
+    closed = updated_through.astimezone(UTC).date() - timedelta(days=1)
+    return max(backfilled_through, closed)
 
 
 def _months(papers_per_day: dict[date, int], collected_through: date | None) -> list[MonthCount]:

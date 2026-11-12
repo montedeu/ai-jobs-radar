@@ -670,7 +670,8 @@ class AnthropicModelClient:
     def __init__(self) -> None:
         import anthropic
 
-        # The key comes from an environment variable; in Cloud Run Secret Manager sets it.
+        # The key comes from an environment variable. Putting it in Secret Manager for Cloud Run
+        # is not done yet; see #22.
         self._client = anthropic.Anthropic()
 
     def _count(self, request: ExtractionRequest, model: str, config: RequestConfig) -> int:
