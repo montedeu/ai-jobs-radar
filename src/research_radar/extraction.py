@@ -98,11 +98,18 @@ class BudgetExceeded(Exception):
 
 
 def start_run(
-    connection: psycopg.Connection, *, model: str, prompt_hash: str, note: str = ""
+    connection: psycopg.Connection,
+    *,
+    model: str,
+    prompt_hash: str,
+    note: str = "",
+    full: bool = False,
 ) -> int:
+    """Creates a run. A full run is one meant to cover the whole history (see runs.py)."""
     run_id = connection.execute(
-        "INSERT INTO extraction_run (model, prompt_hash, note) VALUES (%s, %s, %s) RETURNING id",
-        (model, prompt_hash, note),
+        'INSERT INTO extraction_run (model, prompt_hash, note, "full") VALUES (%s, %s, %s, %s)'
+        " RETURNING id",
+        (model, prompt_hash, note, full),
     ).fetchone()[0]
     connection.commit()
     return run_id
