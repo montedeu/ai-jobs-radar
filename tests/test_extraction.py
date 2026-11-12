@@ -131,7 +131,7 @@ def run_batch(connection, model, run_id, *requests):
 def mention_rows(connection):
     return connection.execute(
         "SELECT arxiv_id, entity_type, spelling, normal_form, expansion FROM mention"
-        " ORDER BY arxiv_id, entity_type, spelling"
+        ' ORDER BY arxiv_id, entity_type, spelling COLLATE "C"'
     ).fetchall()
 
 
