@@ -1,8 +1,8 @@
 """The synonym dictionary: a file in the repository, loaded into the ``synonym`` table.
 
-The file is the source of truth: an entry takes effect once the developer has committed it
-(ADR 0002). The ``paper_entity`` view joins the table, so loading recomputes canonical
-names without an extraction run.
+The file in the repository is the source of truth; approval is the developer's commit
+(ADR 0002), which the loader does not check. The ``paper_entity`` view joins the table, so
+loading recomputes canonical names without an extraction run.
 """
 
 import csv
@@ -24,12 +24,12 @@ def read_synonyms(path: Path = SYNONYMS_FILE) -> dict[str, str]:
             raise ValueError(f"{path.name}: header must be {','.join(_COLUMNS)}")
         synonyms: dict[str, str] = {}
         for row in reader:
-            key, name = row["normal_form"], (row["canonical_name"] or "").strip()
+            key, name = row["normal_form"], row["canonical_name"] or ""
             if not key or key != normal_form(key):
                 raise ValueError(f"{path.name}: {key!r} is not a normal form")
             if key in synonyms:
                 raise ValueError(f"{path.name}: {key!r} appears twice")
-            if not name:
+            if not name.strip():
                 raise ValueError(f"{path.name}: {key!r} has an empty canonical name")
             synonyms[key] = name
     return synonyms
