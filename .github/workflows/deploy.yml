@@ -85,20 +85,24 @@ jobs:
 
       # The collect job connects differently from the server (its own address, a session
       # lock), so the server's smoke test says nothing about it. This runs the new image
-      # as far as a job goes before its first request to arXiv, on the migrate job, which
-      # already has the image and the database secret; if it fails, the collect job keeps
-      # the previous image.
+      # as far as a collection job goes before its first request to arXiv, on the migrate
+      # job, which already has the image and the database secret; if it fails, the collect
+      # job keeps the previous image. It checks the start of collection only: the extraction
+      # step after it (requests to the Batches API) is not exercised here.
       - name: Check that a collection job could start
         run: gcloud run jobs execute "$MIGRATE_JOB" --args check-jobs --wait --quiet
 
-      # --max-retries 0: a failed run is recorded in the job run log and the next
-      # scheduled run picks up from the last success; a blind retry would only repeat
-      # the same requests to arXiv. --task-timeout 60m is for the one-off backfill
-      # (--args=backfill, about 20 minutes per year of history); a daily run takes seconds.
+      # The job runs `daily`: collection from arXiv, then the extraction step (collecting
+      # sent batches and sending new papers through the Batches API). --max-retries 0: a
+      # failed run is recorded in the job run log and the next scheduled run picks up from
+      # the last success; a blind retry would only repeat the same requests to arXiv and
+      # to the API. --task-timeout 60m is for the one-off backfill (--args=backfill, about
+      # 20 minutes per year of history); a daily run collects in seconds, but counting
+      # tokens and sending a batch can take minutes.
       - name: Deploy the collect job
         run: |
           gcloud run jobs deploy "$COLLECT_JOB" \
-            --image "$IMAGE" --args collect \
+            --image "$IMAGE" --args daily \
             --service-account "$RUNTIME_SA" \
             --set-secrets DATABASE_URL=database-url:latest \
             --tasks 1 --parallelism 1 --max-retries 0 --task-timeout 60m \

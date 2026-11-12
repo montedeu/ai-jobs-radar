@@ -1,6 +1,7 @@
 """``radar``: the single entry point of the image; each Cloud Run resource runs one command."""
 
 import argparse
+import logging
 from pathlib import Path
 
 from research_radar.frequencies import DEFAULT_CATEGORY, DEFAULT_LIMIT
@@ -8,6 +9,7 @@ from research_radar.frequencies import DEFAULT_CATEGORY, DEFAULT_LIMIT
 COMMANDS = {
     "migrate": "apply schema migrations up to the latest",
     "collect": "store the papers arXiv published or revised since the last run",
+    "daily": "collect, then collect the sent batches and send the new papers to extraction",
     "backfill": "store the history of every slice, resuming where it stopped",
     "check-jobs": "fail unless a collection job could start (no request to arXiv)",
     "frequencies": "write the shares of the top entities of an extraction run to a Markdown file",
@@ -31,6 +33,18 @@ def main(argv: list[str] | None = None) -> None:
         "--max-papers",
         type=_positive,
         help="the limit on papers read in this run; raise it after the job was down for long",
+    )
+    parsers["daily"].add_argument(
+        "--max-papers",
+        type=_positive,
+        help="the limit on papers read by the collection step; raise it after the job was "
+        "down for long",
+    )
+    parsers["daily"].add_argument(
+        "--max-extract-papers",
+        type=_positive,
+        help="the limit on papers sent to extraction in this run; raise it after a full run "
+        "was switched to",
     )
     frequencies = parsers["frequencies"]
     frequencies.add_argument("--run", type=_positive, required=True, help="the extraction run id")
@@ -67,6 +81,28 @@ def main(argv: list[str] | None = None) -> None:
         from research_radar import collect
 
         collect.run(max_papers=args.max_papers)
+    elif args.command == "daily":
+        from research_radar import collect, daily_extraction, extraction
+        from research_radar.settings import EXTRACTION_DAILY_MAX_PAPERS
+
+        # Each step has its own row in the run log and its own try: a failure of one must
+        # not keep the other from running.
+        failed = False
+        steps = (
+            lambda: collect.run(max_papers=args.max_papers),
+            lambda: daily_extraction.run(
+                client_factory=extraction.AnthropicModelClient,
+                max_papers=args.max_extract_papers or EXTRACTION_DAILY_MAX_PAPERS,
+            ),
+        )
+        for step in steps:
+            try:
+                step()
+            except Exception:
+                logging.exception("a step of the daily job failed")
+                failed = True
+        if failed:
+            raise SystemExit(1)
     elif args.command == "check-jobs":
         from research_radar import collect
 
