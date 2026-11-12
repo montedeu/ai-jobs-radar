@@ -5,15 +5,17 @@ the process that sent it may be gone by then. Everything the second step needs i
 database. The model is reached only through ModelClient; tests pass a fake one.
 """
 
+import json
 import logging
 import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from decimal import Decimal
 from typing import Any, Protocol
 
 import psycopg
+from psycopg.types.json import Jsonb
 from pydantic import ValidationError
 
 from research_radar.mentions import PaperMentions
@@ -45,8 +47,50 @@ EXTRACTION_PROMPT = (
 _ARXIV_ID = re.compile(r"[0-9]{4}\.[0-9]{4,5}")
 
 
-def prompt_hash() -> str:
-    return text_hash(EXTRACTION_PROMPT)
+# The user message of a request; {title} and {abstract} stand for the paper's own text.
+MESSAGE_TEMPLATE = "Title: {title}\n\nAbstract: {abstract}"
+
+
+@dataclass(frozen=True)
+class RequestConfig:
+    """What a run fixes about its requests besides the model and the texts."""
+
+    # False: the request switches the model's reasoning off.
+    reasoning: bool = True
+    max_output_tokens: int = EXTRACTION_MAX_OUTPUT_TOKENS
+
+
+DEFAULT_CONFIG = RequestConfig()
+
+
+class RunConfigMismatch(Exception):
+    """The code would send requests that differ from the ones the run was started with."""
+
+
+def _output_schema() -> dict[str, Any]:
+    # The model's answer is held to the schema; transform_schema is the SDK's way to make
+    # a pydantic schema one the API accepts.
+    from anthropic import transform_schema
+
+    return transform_schema(PaperMentions)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def config_hash(config: RequestConfig) -> str:
+    """The hash of everything that shapes the model's answer except the paper's text."""
+    return text_hash(
+        _canonical_json(
+            {
+                "system": EXTRACTION_PROMPT,
+                "message_template": MESSAGE_TEMPLATE,
+                "output_schema": _output_schema(),
+                "config": asdict(config),
+            }
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -79,9 +123,13 @@ class BatchRejected(Exception):
 class ModelClient(Protocol):
     """The only place the model is called."""
 
-    def count_tokens(self, requests: Sequence[ExtractionRequest], *, model: str) -> int: ...
+    def count_tokens(
+        self, requests: Sequence[ExtractionRequest], *, model: str, config: RequestConfig
+    ) -> int: ...
 
-    def submit_batch(self, requests: Sequence[ExtractionRequest], *, model: str) -> str:
+    def submit_batch(
+        self, requests: Sequence[ExtractionRequest], *, model: str, config: RequestConfig
+    ) -> str:
         """Returns the provider's batch id. Raises BatchRejected for a refusal that
         certainly created nothing."""
         ...
@@ -107,11 +155,13 @@ def start_run(
     connection: psycopg.Connection,
     *,
     model: str,
-    prompt_hash: str,
+    config: RequestConfig = DEFAULT_CONFIG,
     note: str = "",
     full: bool = False,
 ) -> int:
-    """Creates a run. A full run is one meant to cover the whole history (see runs.py).
+    """Creates a run pinned to the code's request configuration (see config_hash).
+
+    A full run is one meant to cover the whole history (see runs.py).
 
     A full run also records its scope in the same transaction: the papers of the slices
     since HISTORY_START that exist now, with an id that can be extracted at all. Papers
@@ -121,9 +171,9 @@ def start_run(
     require_idle(connection)
     with connection.transaction():
         run_id = connection.execute(
-            "INSERT INTO extraction_run (model, prompt_hash, note, is_full)"
-            " VALUES (%s, %s, %s, %s) RETURNING id",
-            (model, prompt_hash, note, full),
+            "INSERT INTO extraction_run (model, prompt_hash, request_config, note, is_full)"
+            " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (model, config_hash(config), Jsonb(asdict(config)), note, full),
         ).fetchone()[0]
         if full:
             connection.execute(
@@ -198,7 +248,9 @@ def submit(
 
     Title and abstract are read from the database here, so the hash recorded for what was
     sent is always the hash of what was sent. Returns None when there is nothing to send.
-    Raises BudgetExceeded, before anything is sent, when the batch's most expensive outcome
+    Raises RunConfigMismatch, before anything is counted or recorded, when the code's request
+    configuration is no longer the one the run was started with. Raises BudgetExceeded, before
+    anything is sent, when the batch's most expensive outcome
     plus what is spent passes the ceiling. Ids of a shape that cannot be sent (see
     _ARXIV_ID) are left out of the batch and logged as a warning.
 
@@ -211,15 +263,17 @@ def submit(
     if not arxiv_ids:
         return None
     with connection.transaction():
-        model = _run_model(connection, run_id)
+        model, config = _run_settings(connection, run_id)
         todo = _due(connection, run_id, arxiv_ids)
     if not todo:
         return None
     for _attempt in range(MAX_COUNTS):
         # Counting is slow network work and takes no money; it stays outside the lock below.
-        input_tokens = client.count_tokens([request for request, _ in todo], model=model)
+        input_tokens = client.count_tokens(
+            [request for request, _ in todo], model=model, config=config
+        )
         # The output is counted at the cap for every paper: the real size is not known before.
-        estimate = _usd(model, input_tokens, len(todo) * EXTRACTION_MAX_OUTPUT_TOKENS)
+        estimate = _usd(model, input_tokens, len(todo) * config.max_output_tokens)
         with connection.transaction():
             # Two submits at once would each see the same spent money and both pass the ceiling.
             connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
@@ -253,7 +307,9 @@ def submit(
     else:
         raise AbstractsKeepChanging(f"papers changed during each of {MAX_COUNTS} counts")
     try:
-        provider_batch_id = client.submit_batch([request for request, _ in todo], model=model)
+        provider_batch_id = client.submit_batch(
+            [request for request, _ in todo], model=model, config=config
+        )
     except BatchRejected:
         with connection.transaction():
             connection.execute(
@@ -279,13 +335,25 @@ def _supported(arxiv_ids: Sequence[str]) -> list[str]:
     return [i for i in unique if i in supported]
 
 
-def _run_model(connection: psycopg.Connection, run_id: int) -> str:
-    row = connection.execute("SELECT model FROM extraction_run WHERE id = %s", (run_id,)).fetchone()
+def _run_settings(connection: psycopg.Connection, run_id: int) -> tuple[str, RequestConfig]:
+    """The run's model and request configuration, once the code is known to match it."""
+    row = connection.execute(
+        "SELECT model, prompt_hash, request_config FROM extraction_run WHERE id = %s", (run_id,)
+    ).fetchone()
     if row is None:
         raise ValueError(f"no extraction run {run_id}")
-    if row[0] not in BATCH_PRICES_USD_PER_MTOK:
-        raise ValueError(f"no batch prices for model {row[0]!r}; add them to settings.py")
-    return row[0]
+    model, pinned_hash, stored = row
+    if model not in BATCH_PRICES_USD_PER_MTOK:
+        raise ValueError(f"no batch prices for model {model!r}; add them to settings.py")
+    # A run from before the config was stored has an empty object: the default one.
+    known = {field.name for field in fields(RequestConfig)}
+    config = RequestConfig(**{key: value for key, value in stored.items() if key in known})
+    if config_hash(config) != pinned_hash:
+        raise RunConfigMismatch(
+            f"run {run_id} was started with another prompt, template, schema or request "
+            "configuration than the code has now; start a new run"
+        )
+    return model, config
 
 
 def _due(
@@ -492,26 +560,28 @@ def _store(
     return len(rows)
 
 
-def request_params(request: ExtractionRequest, model: str) -> dict[str, Any]:
+def request_params(request: ExtractionRequest, model: str, config: RequestConfig) -> dict[str, Any]:
     """The Messages API parameters for one paper; a batch entry and a token count share them."""
-    from anthropic import transform_schema
-
-    return {
+    params: dict[str, Any] = {
         "model": model,
         "system": EXTRACTION_PROMPT,
         "messages": [{"role": "user", "content": _request_text(request)}],
-        # The model's answer is held to the schema; transform_schema is the SDK's way to
-        # make a pydantic schema one the API accepts. Low effort: reading an abstract for
-        # names needs little thinking, and thinking tokens are billed as output.
+        # Low effort: reading an abstract for names needs little thinking, and thinking
+        # tokens are billed as output.
         "output_config": {
             "effort": "low",
-            "format": {"type": "json_schema", "schema": transform_schema(PaperMentions)},
+            "format": {"type": "json_schema", "schema": _output_schema()},
         },
     }
+    if not config.reasoning:
+        # Claude Haiku 5.5 thinks unless told not to; "disabled" is accepted at effort high
+        # or below, and this request is at low. Haiku 5.5 has no budget_tokens.
+        params["thinking"] = {"type": "disabled"}
+    return params
 
 
 def _request_text(request: ExtractionRequest) -> str:
-    return f"Title: {request.title}\n\nAbstract: {request.abstract}"
+    return MESSAGE_TEMPLATE.format(title=request.title, abstract=request.abstract)
 
 
 _REFUSED_BEFORE_CREATING = frozenset({400, 401, 403, 404, 409, 413, 422, 429})
@@ -562,10 +632,13 @@ class AnthropicModelClient:
         # The key comes from an environment variable; in Cloud Run Secret Manager sets it.
         self._client = anthropic.Anthropic()
 
-    def _count(self, request: ExtractionRequest, model: str) -> int:
-        return self._client.messages.count_tokens(**request_params(request, model)).input_tokens
+    def _count(self, request: ExtractionRequest, model: str, config: RequestConfig) -> int:
+        params = request_params(request, model, config)
+        return self._client.messages.count_tokens(**params).input_tokens
 
-    def count_tokens(self, requests: Sequence[ExtractionRequest], *, model: str) -> int:
+    def count_tokens(
+        self, requests: Sequence[ExtractionRequest], *, model: str, config: RequestConfig
+    ) -> int:
         """Counts the batch in a few calls instead of one per paper.
 
         What every request shares (system prompt, schema, framing) is counted once, on a
@@ -574,32 +647,37 @@ class AnthropicModelClient:
         more, so the sum is an overestimate, which is the safe side for a ceiling. The
         endpoint counts and does not bill.
         """
-        overhead = self._count(ExtractionRequest("", "", ""), model)
+        overhead = self._count(ExtractionRequest("", "", ""), model, config)
         total = len(requests) * overhead
         part: list[str] = []
         size = 0
         for request in requests:
             text = _request_text(request)
             if part and size + len(text) > COUNT_CHARS_PER_CALL:
-                total += self._count_part(part, model)
+                total += self._count_part(part, model, config)
                 part, size = [], 0
             part.append(text)
             size += len(text)
         if part:
-            total += self._count_part(part, model)
+            total += self._count_part(part, model, config)
         return total
 
-    def _count_part(self, texts: list[str], model: str) -> int:
+    def _count_part(self, texts: list[str], model: str, config: RequestConfig) -> int:
         # A part is one request whose message is the papers' texts one after another.
-        return self._count(ExtractionRequest("", "", "\n\n".join(texts)), model)
+        return self._count(ExtractionRequest("", "", "\n\n".join(texts)), model, config)
 
-    def submit_batch(self, requests: Sequence[ExtractionRequest], *, model: str) -> str:
+    def submit_batch(
+        self, requests: Sequence[ExtractionRequest], *, model: str, config: RequestConfig
+    ) -> str:
         import anthropic
 
         entries = [
             {
                 "custom_id": _custom_id(r.arxiv_id),
-                "params": {**request_params(r, model), "max_tokens": EXTRACTION_MAX_OUTPUT_TOKENS},
+                "params": {
+                    **request_params(r, model, config),
+                    "max_tokens": config.max_output_tokens,
+                },
             }
             for r in requests
         ]
