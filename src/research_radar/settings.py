@@ -26,3 +26,8 @@ BATCH_PRICES_USD_PER_MTOK = {
 # above the few hundred tokens of the mentions. The cost estimate assumes every paper
 # uses all of it: a batch is never allowed to cost more than the estimate said.
 EXTRACTION_MAX_OUTPUT_TOKENS = 2048
+
+# How many collected batches may carry a paper, in one run and with the same abstract,
+# without a usable answer before the run gives up on it. A full run does not wait for such
+# a paper to become current, and the daily job does not send it again.
+EXTRACTION_MAX_ATTEMPTS = 3

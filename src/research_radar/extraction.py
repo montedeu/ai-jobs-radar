@@ -21,8 +21,10 @@ from research_radar.normalize import normal_form
 from research_radar.papers import text_hash
 from research_radar.settings import (
     BATCH_PRICES_USD_PER_MTOK,
+    CATEGORIES,
     EXTRACTION_CEILING_USD,
     EXTRACTION_MAX_OUTPUT_TOKENS,
+    HISTORY_START,
 )
 
 log = logging.getLogger(__name__)
@@ -105,12 +107,36 @@ def start_run(
     note: str = "",
     full: bool = False,
 ) -> int:
-    """Creates a run. A full run is one meant to cover the whole history (see runs.py)."""
-    run_id = connection.execute(
-        'INSERT INTO extraction_run (model, prompt_hash, note, "full") VALUES (%s, %s, %s, %s)'
-        " RETURNING id",
-        (model, prompt_hash, note, full),
-    ).fetchone()[0]
+    """Creates a run. A full run is one meant to cover the whole history (see runs.py).
+
+    A full run also records its scope in the same transaction: the papers of the slices
+    since HISTORY_START that exist now, with an id that can be extracted at all. Papers
+    that come later, or gain a slice later, are not in it; the daily job sends them to
+    the current run.
+    """
+    with connection.transaction():
+        run_id = connection.execute(
+            "INSERT INTO extraction_run (model, prompt_hash, note, is_full)"
+            " VALUES (%s, %s, %s, %s) RETURNING id",
+            (model, prompt_hash, note, full),
+        ).fetchone()[0]
+        if full:
+            connection.execute(
+                """
+                INSERT INTO extraction_run_scope (run_id, arxiv_id)
+                SELECT %(run)s, p.arxiv_id FROM paper p
+                 WHERE p.first_version_date >= %(start)s
+                   AND p.arxiv_id ~ %(shape)s
+                   AND EXISTS (SELECT 1 FROM paper_category c
+                                WHERE c.arxiv_id = p.arxiv_id AND c.category = ANY(%(slices)s))
+                """,
+                {
+                    "run": run_id,
+                    "start": HISTORY_START,
+                    "shape": f"^{_ARXIV_ID.pattern}$",
+                    "slices": list(CATEGORIES),
+                },
+            )
     connection.commit()
     return run_id
 

@@ -1,40 +1,26 @@
-from datetime import UTC, datetime, timedelta
-
 import psycopg
 import pytest
 
 from research_radar.extraction import start_run
 from research_radar.runs import current_run, missing_papers, promote
-from research_radar.settings import EXTRACTION_MODEL
-
-T0 = datetime(2025, 12, 1, 12, tzinfo=UTC)
-RUN_AT = T0 + timedelta(hours=1)
-LATER = T0 + timedelta(hours=2)
+from research_radar.settings import EXTRACTION_MAX_ATTEMPTS, EXTRACTION_MODEL
 
 
 @pytest.fixture
 def connection(database_url):
-    # Autocommit, like the callers of extraction: a test's own read leaves no transaction open.
+    # Autocommit, like the callers of extraction: no transaction is left open by a read.
     with psycopg.connect(database_url, autocommit=True) as connection:
         yield connection
 
 
-def add_paper(
-    connection,
-    arxiv_id,
-    *,
-    categories=("cs.CL",),
-    first_version_date="2025-11-03",
-    collected_at=T0,
-    abstract_hash="h",
-):
+def add_paper(connection, arxiv_id, *, categories=("cs.CL",), first_version_date="2025-11-03"):
     connection.execute(
         """
         INSERT INTO paper (arxiv_id, version, title, abstract, abstract_hash, authors,
-                           primary_category, first_version_date, arxiv_updated_at, collected_at)
-        VALUES (%s, 1, 't', 'a', %s, '[]', %s, %s, '2025-11-03', %s)
+                           primary_category, first_version_date, arxiv_updated_at)
+        VALUES (%s, 1, 't', 'a', 'h', '[]', %s, %s, '2025-11-03')
         """,
-        (arxiv_id, abstract_hash, categories[0], first_version_date, collected_at),
+        (arxiv_id, categories[0], first_version_date),
     )
     for category in categories:
         connection.execute(
@@ -42,20 +28,31 @@ def add_paper(
         )
 
 
-def new_run(connection, *, full=True, created_at=RUN_AT):
-    run_id = start_run(connection, model=EXTRACTION_MODEL, prompt_hash="stub", full=full)
-    connection.execute(
-        "UPDATE extraction_run SET created_at = %s WHERE id = %s", (created_at, run_id)
-    )
-    return run_id
+def new_run(connection, *, full=True):
+    return start_run(connection, model=EXTRACTION_MODEL, prompt_hash="stub", full=full)
 
 
-def mark_done(connection, run_id, *arxiv_ids, abstract_hash="h"):
+def mark_done(connection, run_id, *arxiv_ids):
     for arxiv_id in arxiv_ids:
         connection.execute(
             "INSERT INTO paper_extraction (run_id, arxiv_id, abstract_hash, input_tokens,"
-            " output_tokens) VALUES (%s, %s, %s, 1, 1)",
-            (run_id, arxiv_id, abstract_hash),
+            " output_tokens) VALUES (%s, %s, 'h', 1, 1)",
+            (run_id, arxiv_id),
+        )
+
+
+def fail_attempts(connection, run_id, arxiv_id, count, *, abstract_hash="h"):
+    """Collected batches that carried the paper and got no usable answer."""
+    for _ in range(count):
+        batch_id = connection.execute(
+            "INSERT INTO extraction_batch (run_id, status, estimated_cost_usd)"
+            " VALUES (%s, 'collected', 0) RETURNING id",
+            (run_id,),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash)"
+            " VALUES (%s, %s, %s)",
+            (batch_id, arxiv_id, abstract_hash),
         )
 
 
@@ -67,7 +64,6 @@ def papers(connection):
     for arxiv_id in CL:
         add_paper(connection, arxiv_id)
     add_paper(connection, "2511.00004", categories=("cs.CV",))
-    add_paper(connection, "2511.00005", collected_at=LATER)
 
 
 def test_no_current_run_before_any_promotion(connection, papers):
@@ -79,12 +75,9 @@ def test_no_current_run_before_any_promotion(connection, papers):
 def test_start_run_records_whether_the_run_is_full(connection):
     full = new_run(connection)
     pilot = new_run(connection, full=False)
-    rows = connection.execute('SELECT id, "full" FROM extraction_run ORDER BY id').fetchall()
-    assert rows == [(full, True), (pilot, False)]
-    assert start_run(connection, model=EXTRACTION_MODEL, prompt_hash="x") > pilot
-    assert connection.execute('SELECT "full" FROM extraction_run ORDER BY id DESC').fetchone() == (
-        False,
-    )
+    default = start_run(connection, model=EXTRACTION_MODEL, prompt_hash="x")
+    rows = connection.execute("SELECT id, is_full FROM extraction_run ORDER BY id").fetchall()
+    assert rows == [(full, True), (pilot, False), (default, False)]
 
 
 def test_full_run_covering_its_scope_becomes_current(connection, papers):
@@ -100,38 +93,57 @@ def test_full_run_covering_its_scope_becomes_current(connection, papers):
 
 
 def test_full_run_missing_a_paper_does_not_become_current(connection, papers):
-    first = new_run(connection)
-    mark_done(connection, first, *CL)
-    assert promote(connection) == first
-    second = new_run(connection, created_at=RUN_AT + timedelta(minutes=1))
-    mark_done(connection, second, *CL[:2])
-    assert missing_papers(connection, second) == ["2511.00003"]
+    run = new_run(connection)
+    mark_done(connection, run, *CL[:2])
+    assert missing_papers(connection, run) == ["2511.00003"]
     assert promote(connection) is None
+    assert current_run(connection) is None
 
 
 def test_pilot_run_covering_everything_never_becomes_current(connection, papers):
     pilot = new_run(connection, full=False)
     mark_done(connection, pilot, *CL)
-    assert missing_papers(connection, pilot) == []
     assert promote(connection) is None
     assert current_run(connection) is None
 
 
 def test_papers_collected_after_the_run_started_are_outside_its_scope(connection, papers):
     run = new_run(connection)
-    assert "2511.00005" not in missing_papers(connection, run)
+    add_paper(connection, "2511.00005")
     mark_done(connection, run, *CL)
     assert missing_papers(connection, run) == []
-    # A paper collected at the very moment the run was created is inside the scope.
-    add_paper(connection, "2511.00006", collected_at=RUN_AT)
-    assert missing_papers(connection, run) == ["2511.00006"]
+    assert promote(connection) == run
+
+
+def test_paper_that_gained_the_category_after_the_start_is_outside_the_scope(connection, papers):
+    run = new_run(connection)
+    connection.execute("INSERT INTO paper_category VALUES ('2511.00004', 'cs.CL')")
+    mark_done(connection, run, *CL)
+    assert missing_papers(connection, run) == []
+    assert promote(connection) == run
+
+
+def test_papers_of_other_slices_and_before_history_start_are_outside_the_scope(connection, papers):
+    add_paper(connection, "2511.00007", first_version_date="2025-10-31")
+    add_paper(connection, "2511.00008", categories=("cs.CV", "cs.CL"))  # cross-listed
+    run = new_run(connection)
+    mark_done(connection, run, *CL)
+    assert missing_papers(connection, run) == ["2511.00008"]
+
+
+def test_papers_with_an_id_that_cannot_be_extracted_are_outside_the_scope(connection, papers):
+    add_paper(connection, "hep-th/9901001")
+    run = new_run(connection)
+    mark_done(connection, run, *CL)
+    assert missing_papers(connection, run) == []
+    assert promote(connection) == run
 
 
 def test_previous_run_stays_current_until_the_new_one_covers_its_scope(connection, papers):
     first = new_run(connection)
     mark_done(connection, first, *CL)
     assert promote(connection) == first
-    second = new_run(connection, created_at=RUN_AT + timedelta(minutes=1))
+    second = new_run(connection)
     mark_done(connection, second, *CL[:2])
     assert promote(connection) is None
     assert current_run(connection) == first
@@ -142,7 +154,7 @@ def test_previous_run_stays_current_until_the_new_one_covers_its_scope(connectio
 
 def test_older_full_run_does_not_replace_a_newer_current_one(connection, papers):
     older = new_run(connection)
-    newer = new_run(connection, created_at=RUN_AT + timedelta(minutes=1))
+    newer = new_run(connection)
     mark_done(connection, newer, *CL)
     assert promote(connection) == newer
     mark_done(connection, older, *CL)
@@ -152,7 +164,7 @@ def test_older_full_run_does_not_replace_a_newer_current_one(connection, papers)
 
 def test_of_two_covering_full_runs_the_newer_becomes_current(connection, papers):
     older = new_run(connection)
-    newer = new_run(connection, created_at=RUN_AT + timedelta(minutes=1))
+    newer = new_run(connection)
     mark_done(connection, older, *CL)
     mark_done(connection, newer, *CL)
     assert promote(connection) == newer
@@ -161,20 +173,11 @@ def test_of_two_covering_full_runs_the_newer_becomes_current(connection, papers)
 
 def test_newer_run_that_is_unfinished_does_not_block_an_older_finished_one(connection, papers):
     older = new_run(connection)
-    newer = new_run(connection, created_at=RUN_AT + timedelta(minutes=1))
+    newer = new_run(connection)
     mark_done(connection, older, *CL)
     mark_done(connection, newer, CL[0])
     assert promote(connection) == older
     assert current_run(connection) == older
-
-
-def test_papers_of_other_slices_and_before_history_start_are_outside_the_scope(connection, papers):
-    add_paper(connection, "2511.00007", first_version_date="2025-10-31")
-    # Cross-listed: cs.CL is one of its categories, though not the primary one.
-    add_paper(connection, "2511.00008", categories=("cs.CV", "cs.CL"))
-    run = new_run(connection)
-    mark_done(connection, run, *CL)
-    assert missing_papers(connection, run) == ["2511.00008"]
 
 
 def test_a_paper_whose_abstract_changed_after_the_mark_is_still_covered(connection, papers):
@@ -183,6 +186,29 @@ def test_a_paper_whose_abstract_changed_after_the_mark_is_still_covered(connecti
     connection.execute("UPDATE paper SET abstract_hash = 'new' WHERE arxiv_id = '2511.00001'")
     assert missing_papers(connection, run) == []
     assert promote(connection) == run
+
+
+def test_paper_given_up_on_does_not_block_the_switch(connection, papers):
+    run = new_run(connection)
+    mark_done(connection, run, *CL[:2])
+    fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS)
+    assert missing_papers(connection, run) == []
+    assert promote(connection) == run
+
+
+def test_paper_with_fewer_failed_attempts_still_blocks_the_switch(connection, papers):
+    run = new_run(connection)
+    mark_done(connection, run, *CL[:2])
+    fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS - 1)
+    assert missing_papers(connection, run) == [CL[2]]
+    assert promote(connection) is None
+
+
+def test_failed_attempts_on_an_older_abstract_do_not_count(connection, papers):
+    run = new_run(connection)
+    mark_done(connection, run, *CL[:2])
+    fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS, abstract_hash="old")
+    assert missing_papers(connection, run) == [CL[2]]
 
 
 def test_full_run_over_an_empty_scope_becomes_current(connection):
@@ -195,14 +221,17 @@ def test_promote_is_idempotent(connection, papers):
     run = new_run(connection)
     mark_done(connection, run, *CL)
     assert promote(connection) == run
-    (since,) = connection.execute(
-        "SELECT current_since FROM extraction_run WHERE id = %s", (run,)
-    ).fetchone()
+    query = "SELECT current_since FROM extraction_run WHERE id = %s"
+    (since,) = connection.execute(query, (run,)).fetchone()
     assert promote(connection) is None
     assert current_run(connection) == run
-    assert connection.execute(
-        "SELECT current_since FROM extraction_run WHERE id = %s", (run,)
-    ).fetchone() == (since,)
+    assert connection.execute(query, (run,)).fetchone() == (since,)
+
+
+def test_promote_refuses_a_connection_with_a_transaction_open(connection, papers):
+    new_run(connection)
+    with connection.transaction(), pytest.raises(ValueError, match="transaction"):
+        promote(connection)
 
 
 def test_missing_papers_are_sorted_by_arxiv_id(connection, papers):
