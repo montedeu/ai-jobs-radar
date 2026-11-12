@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -245,6 +246,7 @@ def test_collection_by_the_daily_job_extends_the_collected_history(client, datab
             if number != 10:
                 add_paper(connection, f"2512.{number:05d}", f"2025-12-{number:02d}", ["cs.CL"])
         connection.commit()
+    record_job_run(database_url, "backfill", "succeeded", "2025-12-01T03:00Z")
 
     found = cs_cl(status(client))
 
@@ -291,7 +293,7 @@ def test_failed_history_summary_does_not_hide_the_latest_runs(
     result = response.json()["result"]["structuredContent"]
     assert [run["job"] for run in result["latest_runs"]] == ["collect"]
     assert result["history"] is None
-    assert result["history_error"] == "OperationalError: connection lost"
+    assert result["history_error"] == "OperationalError"
 
 
 def test_query_failing_inside_the_snapshot_reports_its_own_error(client, database_url, monkeypatch):
@@ -304,4 +306,110 @@ def test_query_failing_inside_the_snapshot_reports_its_own_error(client, databas
 
     result = response.json()["result"]["structuredContent"]
     assert result["history"] is None
-    assert result["history_error"].startswith("DivisionByZero:")
+    assert result["history_error"] == "DivisionByZero (SQLSTATE 22012)"
+
+
+def record_job_run(database_url, job, status, started, details=None):
+    with connect(database_url) as connection:
+        connection.execute(
+            "INSERT INTO job_run (job, status, started_at, finished_at, details)"
+            " VALUES (%s, %s, %s, %s, %s)",
+            (job, status, started, started, Jsonb(details or {})),
+        )
+        connection.commit()
+
+
+def test_partial_backfill_does_not_extend_collected_history_by_the_daily_job(client, database_url):
+    with connect(database_url) as connection:
+        set_state(connection, "cs.CL", "2026-01-15", "2026-11-12T06:00Z")
+        add_paper(connection, "2511.00001", "2025-11-03", ["cs.CL"])
+        add_paper(connection, "2611.00001", "2026-11-10", ["cs.CL"])
+        connection.commit()
+    record_job_run(database_url, "backfill", "failed", "2026-01-16T03:00Z")
+
+    found = cs_cl(status(client))
+
+    assert found["collected_through"] == "2026-01-15"
+    assert found["empty_days"][-1] == "2026-01-15"
+    assert "2026-03-10" not in found["empty_days"]
+    partial = {m["month"]: m["partial"] for m in found["months"]}
+    assert partial["2025-12"] is False
+    assert partial["2026-02"] is True
+    assert partial["2026-11"] is True
+
+
+def test_latest_run_error_keeps_only_the_error_type(client, database_url):
+    record_job_run(
+        database_url,
+        "collect",
+        "failed",
+        "2025-12-05T06:00Z",
+        {"error": 'OperationalError: connection to server at "ep-secret" user "radar"'},
+    )
+
+    response = call(client, "tools/call", {"name": "service_status", "arguments": {}})
+
+    (run,) = response.json()["result"]["structuredContent"]["latest_runs"]
+    assert run["details"]["error"] == "OperationalError"
+    assert "ep-secret" not in response.text
+
+
+def test_unreachable_database_raises_error_type_and_sqlstate_only(monkeypatch):
+    def refused():
+        raise psycopg.errors.InvalidPassword("host=ep-secret user=radar")
+
+    monkeypatch.setattr(mcp_server, "connect", refused)
+
+    with pytest.raises(mcp_server.StatusUnavailable) as raised:
+        mcp_server.service_status()
+
+    assert str(raised.value) == "InvalidPassword (SQLSTATE 28P01)"
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__
+
+
+def test_any_summary_error_keeps_the_latest_runs_and_gives_only_its_type(
+    client, database_url, fake_arxiv, monkeypatch
+):
+    collect.run(database_url, fake_arxiv)
+
+    def broken(connection):
+        raise ValueError("host=ep-secret")
+
+    monkeypatch.setattr(mcp_server, "history_summary", broken)
+
+    response = call(client, "tools/call", {"name": "service_status", "arguments": {}})
+
+    result = response.json()["result"]["structuredContent"]
+    assert [run["job"] for run in result["latest_runs"]] == ["collect"]
+    assert result["history"] is None
+    assert result["history_error"] == "ValueError"
+    assert "ep-secret" not in response.text
+
+
+def test_history_error_has_no_error_text(client, monkeypatch):
+    def leaking(connection):
+        raise psycopg.errors.InvalidPassword("host=secret-host user=secret-user")
+
+    monkeypatch.setattr(mcp_server, "history_summary", leaking)
+
+    result = call(client, "tools/call", {"name": "service_status", "arguments": {}}).json()[
+        "result"
+    ]["structuredContent"]
+
+    assert "secret" not in result["history_error"]
+    assert result["history_error"] == "InvalidPassword (SQLSTATE 28P01)"
+
+
+def test_slice_collected_only_by_the_daily_job_has_no_collected_history(client, database_url):
+    with connect(database_url) as connection:
+        set_state(connection, "cs.CL", None, "2025-12-03T18:00Z")
+        add_paper(connection, "2511.00001", "2025-11-03", ["cs.CL"])
+        connection.commit()
+
+    found = cs_cl(status(client))
+
+    assert found["collected_through"] is None
+    assert found["empty_days"] == []
+    assert found["empty_day_count"] == 0
+    assert [m["partial"] for m in found["months"]] == [True]
