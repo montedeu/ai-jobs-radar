@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 
+import psycopg
 import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -113,7 +114,7 @@ def set_state(connection, category, backfilled_through, updated_through):
 def collected(database_url):
     """cs.CL collected through 2025-12-03; one cs.CL paper is primary cs.LG."""
     with connect(database_url) as connection:
-        set_state(connection, "cs.CL", "2025-12-03", "2025-12-05T18:00Z")
+        set_state(connection, "cs.CL", "2025-12-03", "2025-12-03T18:00Z")
         days = ["2025-11-01", "2025-11-01", "2025-11-03", "2025-12-01", "2025-12-03", "2025-12-05"]
         for number, day in enumerate(days):
             categories = ["cs.LG", "cs.CL"] if day == "2025-11-03" else ["cs.CL"]
@@ -170,7 +171,7 @@ def test_service_status_reports_backfill_boundary_and_last_daily_collection(
 
     assert cs_cl(history)["backfilled_through"] == "2025-12-03"
     assert datetime.fromisoformat(cs_cl(history)["updated_through"]) == datetime(
-        2025, 12, 5, 18, tzinfo=UTC
+        2025, 12, 3, 18, tzinfo=UTC
     )
     assert datetime.fromisoformat(history["last_daily_collection_at"]) == datetime(
         2025, 12, 5, 6, tzinfo=UTC
@@ -235,3 +236,59 @@ def test_service_status_reports_database_size(client, database_url):
 
     assert history["database_size_bytes"] > 0
     assert history["last_daily_collection_at"] is None
+
+
+def test_collection_by_the_daily_job_extends_the_collected_history(client, database_url):
+    with connect(database_url) as connection:
+        set_state(connection, "cs.CL", "2025-11-30", "2026-01-02T10:00Z")
+        for number in range(1, 32):
+            if number != 10:
+                add_paper(connection, f"2512.{number:05d}", f"2025-12-{number:02d}", ["cs.CL"])
+        connection.commit()
+
+    found = cs_cl(status(client))
+
+    assert found["backfilled_through"] == "2025-11-30"
+    assert found["collected_through"] == "2026-01-01"
+    assert "2025-12-10" in found["empty_days"]
+    assert [d for d in found["empty_days"] if d.startswith("2025-12")] == ["2025-12-10"]
+    partial = {m["month"]: m["partial"] for m in found["months"]}
+    assert partial["2025-12"] is False
+    assert partial["2026-01"] is True
+
+
+def test_collected_through_is_the_backfill_boundary_when_it_is_later(client, collected):
+    assert cs_cl(status(client))["collected_through"] == "2025-12-03"
+
+
+def test_months_run_up_to_the_collected_through_month(client, database_url):
+    with connect(database_url) as connection:
+        set_state(connection, "cs.CL", "2026-01-31", None)
+        add_paper(connection, "2511.00001", "2025-11-03", ["cs.CL"])
+        connection.commit()
+
+    months = cs_cl(status(client))["months"]
+
+    assert [(m["month"], m["papers"]) for m in months] == [
+        ("2025-11", 1),
+        ("2025-12", 0),
+        ("2026-01", 0),
+    ]
+
+
+def test_failed_history_summary_does_not_hide_the_latest_runs(
+    client, database_url, fake_arxiv, monkeypatch
+):
+    collect.run(database_url, fake_arxiv)
+
+    def broken(connection):
+        raise psycopg.OperationalError("connection lost")
+
+    monkeypatch.setattr(mcp_server, "history_summary", broken)
+
+    response = call(client, "tools/call", {"name": "service_status", "arguments": {}})
+
+    result = response.json()["result"]["structuredContent"]
+    assert [run["job"] for run in result["latest_runs"]] == ["collect"]
+    assert result["history"] is None
+    assert result["history_error"] == "OperationalError: connection lost"
