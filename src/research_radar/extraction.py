@@ -339,7 +339,6 @@ def _store_batch(
         return Counter(incomplete=len(sent) - len(answered))
     # Shared locks keep an abstract from changing between this check and the commit. They
     # come after the check above, so a batch that is not stored holds nothing of the papers.
-    # Shared locks keep an abstract from changing between this check and the commit.
     current = dict(
         connection.execute(
             "SELECT arxiv_id, abstract_hash FROM paper WHERE arxiv_id = ANY(%s) FOR SHARE",
