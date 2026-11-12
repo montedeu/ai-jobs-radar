@@ -14,8 +14,16 @@ _NOT_PLURAL_ENDINGS = ("ss", "us", "is", "as")
 
 def normal_form(spelling: str) -> str:
     text = unicodedata.normalize("NFKC", spelling).casefold().translate(_DASHES)
-    text = _WHITESPACE.sub(" ", text).strip().rstrip(".,;:").strip()
-    return _singular_last_word(text)
+    # One pass is not enough: rstrip runs before the final strip, so "Adaptation.-." keeps its
+    # "." (it sits before a space) and a second call drops it. A stored mention must equal what
+    # read_synonyms accepts as a key, so the function repeats until nothing changes. Every step
+    # only shortens the text, so this terminates.
+    previous = None
+    while text != previous:
+        previous = text
+        text = _WHITESPACE.sub(" ", text).strip().rstrip(".,;:").strip()
+        text = _singular_last_word(text)
+    return text
 
 
 def _singular_last_word(text: str) -> str:

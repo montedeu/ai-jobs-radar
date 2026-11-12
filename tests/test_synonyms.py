@@ -4,6 +4,8 @@ The dictionary file is the source of truth (ADR 0002): a change to it recomputes
 names through the ``paper_entity`` view, with no extraction run.
 """
 
+import random
+
 import psycopg
 import pytest
 
@@ -31,6 +33,11 @@ NORMAL_FORM_EXAMPLES = [
     "GPS",
     "GPT-4o",
     "Llama 3.1",
+    "Low-Rank Adaptation.-.",
+    "models.s",
+    "GANs.",
+    "LLMs,.",
+    " -RAG- ",
 ]
 
 
@@ -76,14 +83,28 @@ def test_normal_form_keeps_digits_and_versions():
     assert normal_form("Llama 3.1") == "llama 3.1"
 
 
-def test_normal_form_is_idempotent():
+def test_normal_form_is_idempotent_on_examples():
     for spelling in NORMAL_FORM_EXAMPLES:
-        assert normal_form(normal_form(spelling)) == normal_form(spelling)
+        assert normal_form(normal_form(spelling)) == normal_form(spelling), spelling
+
+
+def test_normal_form_is_idempotent_on_random_text():
+    rng = random.Random(20261113)
+    alphabet = "abcAB s-.,–  "
+    for _ in range(2000):
+        spelling = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
+        assert normal_form(normal_form(spelling)) == normal_form(spelling), spelling
+
+
+def test_normal_form_drops_plural_s_once():
+    assert normal_form("bosses") == "bosse"
+    assert normal_form("bosse") == "bosse"
 
 
 def test_normal_form_of_nothing_is_empty():
     assert normal_form("") == ""
     assert normal_form(" - – — ") == ""
+    assert normal_form(".,;:") == ""
 
 
 # --- read_synonyms -------------------------------------------------------------------------
