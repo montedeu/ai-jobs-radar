@@ -71,6 +71,16 @@ def test_normal_form_drops_plural_s_of_last_word():
     assert normal_form("diffusion models") == "diffusion model"
 
 
+def test_plural_s_after_a_digit_is_dropped():
+    assert normal_form("GPT4s") == "gpt4"
+    assert normal_form("A100s") == "a100"
+    assert normal_form("Llama2s") == "llama2"
+
+
+def test_leading_full_stop_is_kept():
+    assert normal_form(".NET") == ".net"
+
+
 def test_normal_form_keeps_words_that_only_look_plural():
     assert normal_form("bias") == "bias"
     assert normal_form("Adam") == "adam"
@@ -92,7 +102,7 @@ def test_normal_form_is_idempotent_on_examples():
 
 def test_normal_form_is_idempotent_on_random_text():
     rng = random.Random(20261113)
-    alphabet = "abcAB s-.,;:–\t 1  "
+    alphabet = "abcAB s-.,;:–\t 0123456789  "
     for _ in range(2000):
         spelling = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
         assert normal_form(normal_form(spelling)) == normal_form(spelling), spelling

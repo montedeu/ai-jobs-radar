@@ -14,23 +14,23 @@ _NOT_PLURAL_ENDINGS = ("ss", "us", "is", "as")
 
 def normal_form(spelling: str) -> str:
     text = unicodedata.normalize("NFKC", spelling).casefold().translate(_DASHES)
-    # Dashes become spaces before the edges are stripped, and the edges are stripped with one
-    # call that takes spaces and punctuation alike. Stripping punctuation and then spaces in
-    # two steps left "Adaptation.-." with its "." (a dash sat between them), so a second call
-    # dropped it: the function must reach its own fixed point in one pass, because a stored
-    # mention has to equal the key that read_synonyms accepts.
-    text = _WHITESPACE.sub(" ", text).strip(" .,;:")
+    # Only the end loses punctuation: a leading full stop is part of the name (".NET" is not
+    # "net"). Dashes become spaces first, so "Adaptation.-." reaches "Adaptation. ." and the one
+    # rstrip takes the whole trailing run. Stripping in two steps left a "." there, and a second
+    # call dropped it; a stored mention has to equal the key that read_synonyms accepts, so the
+    # function must reach its own fixed point in one pass.
+    text = _WHITESPACE.sub(" ", text).strip().rstrip(" .,;:")
     return _singular_last_word(text)
 
 
 def _singular_last_word(text: str) -> str:
-    # Only after a letter: "glasses.s" is not a plural. A word that ends in "s" after a letter
-    # loses one "s" and then ends in a letter, so a second call changes nothing.
+    # After a letter or a digit: "GPT4s" and "A100s" are plurals, "glasses.s" is not. The word
+    # then ends in a letter or digit, not in "s" after one, so a second call changes nothing.
     head, space, last = text.rpartition(" ")
     if (
         len(last) > 3
         and last.endswith("s")
-        and last[-2].isalpha()
+        and last[-2].isalnum()
         and not last.endswith(_NOT_PLURAL_ENDINGS)
     ):
         last = last[:-1]
