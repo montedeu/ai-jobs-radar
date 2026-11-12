@@ -45,3 +45,8 @@ EXTRACTION_MAX_ATTEMPTS = 3
 # A full run does not become current if more than this share of its scope, and more than
 # one paper, was given up on: that is a broken prompt or model, not a few odd abstracts.
 EXTRACTION_MAX_GIVEN_UP_SHARE = 0.01
+
+# The most papers the daily job sends in one run. A normal day is some dozens; far more means
+# the job was down for long or a full run was just switched to, and sending is a decision
+# (the job stops, and the run is repeated with --max-extract-papers).
+EXTRACTION_DAILY_MAX_PAPERS = 500
