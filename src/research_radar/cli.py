@@ -29,35 +29,38 @@ def _positive(text: str) -> int:
 
 def _abandon_batch(connection, extraction, batch_id: int, confirm: bool) -> None:
     row = connection.execute(
-        "SELECT run_id, status, estimated_cost_usd,"
+        "SELECT run_id, status, estimated_cost_usd, provider_batch_id,"
         " (SELECT count(*) FROM extraction_batch_paper WHERE batch_id = b.id)"
         " FROM extraction_batch b WHERE id = %s",
         (batch_id,),
     ).fetchone()
     if row is None:
         raise SystemExit(f"error: no extraction batch {batch_id}")
-    run_id, status, estimate, papers = row
-    print(
-        f"Batch {batch_id} of run {run_id}: {status}, {papers} papers, estimated ${estimate}; "
-        "the estimate stays in the spent total."
-    )
+    run_id, status, estimate, provider_batch_id, papers = row
+    print(f"Batch {batch_id} of run {run_id}: {status}, {papers} papers, estimated ${estimate}.")
     if status not in ("sending", "submitted"):
         raise SystemExit(f"error: only a sending or submitted batch can be abandoned, not {status}")
-    if not confirm:
+    print("The estimate stays in the spent total.")
+    if status == "submitted":
         print(
-            "Nothing was changed. First check the Anthropic console for a batch that was "
-            "created: if this one did leave, giving it up sends its papers again and they are "
-            "paid for twice. Run again with --confirm to give it up."
+            f"This batch did leave (provider batch id {provider_batch_id}). Giving it up means "
+            "its results will not be collected and its papers will be sent again and paid for "
+            "again. If it is still running at the provider, cancel it in the Anthropic console."
         )
+    else:
+        print(
+            "Check the Anthropic console for a batch that was created: if this one did leave, "
+            "its results will not be collected and its papers will be sent again and paid for "
+            "twice."
+        )
+    if not confirm:
+        print("Nothing was changed. Run again with --confirm to give it up.")
         return
     try:
         extraction.abandon_batch(connection, batch_id)
-    except ValueError as error:
+    except (LookupError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error
-    print(
-        f"Abandoned batch {batch_id}: its {papers} papers are due again. If the batch did "
-        "leave, they will be sent again and paid for twice."
-    )
+    print(f"Abandoned batch {batch_id}: its {papers} papers are due again.")
 
 
 def main(argv: list[str] | None = None) -> None:

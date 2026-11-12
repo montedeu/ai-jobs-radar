@@ -138,6 +138,20 @@ def _submit_all(
             details["submitted"] += len(part)
 
 
+def _note_full_run_missing(connection: psycopg.Connection, details: dict[str, Any]) -> None:
+    """How many papers the newest unfinished full run still lacks, as of after the sending.
+
+    A failure here leaves None: a log field must not stop the step or hide its own error.
+    """
+    try:
+        head = runs.head_candidate(connection)
+        details["full_run_missing"] = (
+            None if head is None else runs.run_state(connection, head).missing
+        )
+    except psycopg.Error:
+        details["full_run_missing"] = None
+
+
 def extract_daily(
     connection: psycopg.Connection,
     client_factory: Callable[[], extraction.ModelClient],
@@ -168,10 +182,6 @@ def extract_daily(
         _collect_all(connection, client, details)
         details["promoted"] = runs.promote(connection)
         run_id = details["current_run"] = runs.current_run(connection)
-        # The log then shows how far the full run still is from becoming current.
-        head = runs.head_candidate(connection)
-        if head is not None:
-            details["full_run_missing"] = runs.run_state(connection, head).missing
         if run_id is not None:
             due, details["gave_up"] = _due(connection, run_id)
             details["due"] = len(due)
@@ -184,6 +194,7 @@ def extract_daily(
                 client.resolve()
                 _submit_all(connection, client, run_id, due, details)
     finally:
+        _note_full_run_missing(connection, details)
         try:
             details["spent_usd"] = str(extraction.spent_usd(connection))
         except psycopg.Error:

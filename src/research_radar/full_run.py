@@ -327,9 +327,9 @@ def _abandon_sending(
     given_up = []
     for (batch_id,) in stuck:
         try:
-            extraction.abandon_batch(connection, batch_id)
-        except ValueError:
-            # A collector got to the batch first, so it is not stuck any more.
+            extraction.abandon_batch(connection, batch_id, statuses=("sending",))
+        except extraction.BatchNotAbandonable:
+            # The batch was sent or collected after the list was read, so it is not stuck.
             continue
         given_up.append(batch_id)
     if given_up:

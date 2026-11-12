@@ -51,7 +51,7 @@ def _without_error_text(run: JobRun) -> JobRun:
         details["error"] = _type_only(details["error"])
     if isinstance(details.get("batch_errors"), dict):
         details["batch_errors"] = {
-            batch: _type_only(text) if isinstance(text, str) else text
+            batch: _type_only(text) if isinstance(text, str) else "(скрыто)"
             for batch, text in details["batch_errors"].items()
         }
     return run.model_copy(update={"details": details})
