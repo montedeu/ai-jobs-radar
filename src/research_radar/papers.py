@@ -11,8 +11,12 @@ from research_radar.arxiv_api import Paper
 Outcome = Literal["new", "abstract_changed", "updated", "unchanged"]
 
 
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def abstract_hash(abstract: str) -> str:
-    return hashlib.sha256(abstract.encode()).hexdigest()
+    return text_hash(abstract)
 
 
 def store(connection: psycopg.Connection, paper: Paper) -> Outcome:
