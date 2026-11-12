@@ -9,7 +9,7 @@ import psycopg
 import pytest
 
 from research_radar import cli
-from research_radar.frequencies import top_entities, write_table
+from research_radar.frequencies import FrequencyTable, top_entities, write_table
 
 LORA = ("method", "LoRA")
 BERT = ("model", "BERT")
@@ -36,6 +36,7 @@ class Corpus:
         run_id=None,
         title=None,
         abstract="a",
+        extracted_hash="h",
     ):
         """One paper; returns its arXiv id."""
         self._papers += 1
@@ -53,8 +54,8 @@ class Corpus:
             run_id = run_id or self.run_id
             self.connection.execute(
                 "INSERT INTO paper_extraction (run_id, arxiv_id, abstract_hash, input_tokens,"
-                " output_tokens) VALUES (%s, %s, 'h', 0, 0)",
-                (run_id, arxiv_id),
+                " output_tokens) VALUES (%s, %s, %s, 0, 0)",
+                (run_id, arxiv_id, extracted_hash),
             )
             for entity_type, name in entities:
                 self.mention(arxiv_id, entity_type, name, run_id=run_id)
@@ -73,8 +74,13 @@ class Corpus:
             ),
         )
 
-    def top(self, **kwargs):
+    def table(self, **kwargs):
+        # The function opens its own snapshot transaction, so the inserts are committed first.
+        self.connection.commit()
         return top_entities(self.connection, kwargs.pop("run_id", self.run_id), **kwargs)
+
+    def top(self, **kwargs):
+        return self.table(**kwargs).rows
 
 
 @pytest.fixture
@@ -188,7 +194,7 @@ def test_written_table_has_empty_recommendation_columns_and_examples(corpus, tmp
     corpus.paper([])
     path = tmp_path / "frequencies.md"
 
-    write_table(corpus.top(), path, run_id=corpus.run_id, category="cs.CL", completed=2)
+    write_table(corpus.table(), path)
 
     text = path.read_text()
     lines = text.splitlines()
@@ -201,15 +207,15 @@ def test_written_table_has_empty_recommendation_columns_and_examples(corpus, tmp
     assert cells[:5] == ["1", "lora", "method", "1", "0.50"]
     assert cells[6:] == ["", "", ""]
     assert "tricky" not in row
-    assert "p0001" in text and "A \\| tricky title" in text and "second | line" in text
-    assert "прогон " + str(corpus.run_id) in lines[0]
+    assert "p0001" in text and "A | tricky title" in text and "second | line" in text
+    assert lines[0] == f"# Доли сущностей: прогон {corpus.run_id}, срез cs.CL"
     assert "Статей с отметкой завершения в прогоне: 2." in lines
 
 
 def test_written_table_for_empty_run_says_so_in_the_header(corpus, tmp_path):
     path = tmp_path / "frequencies.md"
 
-    write_table([], path, run_id=9999, category="cs.CL")
+    write_table(corpus.table(run_id=9999), path)
 
     assert "нет статей с отметкой завершения" in path.read_text()
 
@@ -224,3 +230,100 @@ def test_cli_frequencies_writes_the_file(fixture_corpus, database_url, monkeypat
     text = path.read_text()
     assert "| 1 | lora | method | 3 | 0.75 |" in text
     assert "machine translation" in text
+
+
+def test_table_carries_the_denominator_with_the_rows(fixture_corpus):
+    table = fixture_corpus.table()
+
+    assert isinstance(table, FrequencyTable)
+    assert (table.run_id, table.category, table.completed) == (fixture_corpus.run_id, "cs.CL", 4)
+    assert fixture_corpus.table(run_id=9999).completed == 0
+
+
+def test_run_with_marks_but_no_mentions_says_no_entities_not_no_papers(corpus, tmp_path):
+    for _ in range(5):
+        corpus.paper([])
+    path = tmp_path / "out.md"
+
+    write_table(corpus.table(), path)
+
+    text = path.read_text()
+    assert "Статей с отметкой завершения в прогоне: 5." in text
+    assert "Сущностей нет" in text
+    assert "нет статей с отметкой" not in text
+
+
+def test_spellings_in_a_cell_are_separated_by_a_middle_dot(corpus, tmp_path):
+    for spelling in ("LoRA", "Lora"):
+        corpus.mention(corpus.paper([]), "method", spelling, normal_form="lora")
+    path = tmp_path / "out.md"
+
+    write_table(corpus.table(), path)
+
+    assert "| LoRA · Lora |" in path.read_text()
+
+
+def test_example_with_a_changed_abstract_is_marked(corpus, tmp_path):
+    corpus.paper([LORA], extracted_hash="old")
+    corpus.paper([LORA])
+    path = tmp_path / "out.md"
+
+    table = corpus.table()
+    write_table(table, path)
+
+    assert [e.changed for e in table.rows[0].examples] == [True, False]
+    text = path.read_text()
+    assert text.count("Аннотация изменилась после извлечения") == 1
+
+
+def test_abstract_is_not_interpreted_as_markdown(corpus, tmp_path):
+    corpus.paper([LORA], title="# Title", abstract="# not a heading\n- not a list\n```\nfence")
+    path = tmp_path / "out.md"
+
+    write_table(corpus.table(), path)
+
+    lines = path.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("````text"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "````")
+    assert "```" in lines[start:end]  # the abstract's own fence did not close the block
+    assert "# not a heading" in lines[start:end]
+    assert "- not a list" in lines[start:end]
+    outside = lines[:start] + lines[end + 1 :]
+    assert [line for line in outside if line.startswith("#")] == [
+        "# Доли сущностей: прогон 1, срез cs.CL",
+        "## 1. lora (method)",
+        "### p0001",
+    ]
+
+
+def test_spellings_and_examples_are_read_for_the_top_rows_only(corpus):
+    for name in ("a", "b", "c"):
+        corpus.paper([("method", name)])
+    corpus.paper([("method", "a")])
+
+    table = corpus.table(limit=1)
+
+    assert [(r.canonical_name, r.spellings, len(r.examples)) for r in table.rows] == [
+        ("a", ["a"], 2)
+    ]
+
+
+def test_one_snapshot_transaction_is_used(corpus):
+    seen = []
+
+    class Recorder:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, query, *args, **kwargs):
+            seen.append(str(query))
+            return self.inner.execute(query, *args, **kwargs)
+
+        def transaction(self):
+            return self.inner.transaction()
+
+    corpus.paper([LORA])
+    corpus.connection.commit()
+    top_entities(Recorder(corpus.connection), corpus.run_id)
+
+    assert "REPEATABLE READ READ ONLY" in seen[0]
