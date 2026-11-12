@@ -22,14 +22,16 @@ def upgrade() -> None:
         -- steps that can be hours apart, so the state lives here, not in the process.
         -- The row is written as 'sending' before the batch leaves, so a batch that was
         -- paid for is never missing here; a failure in between leaves it 'sending', for
-        -- a person to sort out. This table is also the ledger of spent money: it outlives
-        -- the papers, and a run that has batches cannot be deleted.
+        -- a person to sort out. 'rejected' is a batch the API refused outright: nothing
+        -- was created, so it costs nothing and its papers are due again. This table is
+        -- also the ledger of spent money: it outlives the papers, and a run that has
+        -- batches cannot be deleted.
         CREATE TABLE extraction_batch (
             id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             run_id             bigint      NOT NULL REFERENCES extraction_run ON DELETE RESTRICT,
             provider_batch_id  text        UNIQUE,   -- NULL while 'sending'
             status             text        NOT NULL DEFAULT 'sending'
-                               CHECK (status IN ('sending', 'submitted', 'collected')),
+                               CHECK (status IN ('sending', 'submitted', 'collected', 'rejected')),
             -- the most the batch could cost: counted input plus the output cap
             estimated_cost_usd numeric     NOT NULL,
             -- what every answer of the batch cost, unusable and outdated ones included
