@@ -7,6 +7,7 @@ loading recomputes canonical names without an extraction run.
 
 import csv
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +18,6 @@ from research_radar.normalize import normal_form
 
 SYNONYMS_FILE = Path(__file__).parent / "data" / "synonyms.csv"
 _COLUMNS = ["normal_form", "canonical_name"]
-_LOCK_KEY = 5_021_002  # arbitrary: the advisory lock that makes loads take turns
 
 
 @dataclass(frozen=True)
@@ -51,11 +51,14 @@ def load_synonyms(connection: psycopg.Connection, path: Path = SYNONYMS_FILE) ->
     """Replace the table's content with the file's and, if the file differs from the last
     loaded one, record a version; all or nothing. Returns the entry count."""
     synonyms = read_synonyms(path)
-    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    # Of the parsed content, not of the bytes: reordered lines or other line endings are
+    # not a change of the dictionary.
+    pairs = sorted(synonyms.items())
+    file_sha256 = hashlib.sha256(json.dumps(pairs).encode()).hexdigest()
     with connection.transaction():
         # Two loads at once (deploys in a row) take turns, so the second sees the first's
         # version and adds none. The lock is released at the end of the transaction.
-        connection.execute("SELECT pg_advisory_xact_lock(%s)", (_LOCK_KEY,))
+        connection.execute("SELECT pg_advisory_xact_lock(hashtext('synonym_load'))")
         last = current_dictionary(connection)
         connection.execute("DELETE FROM synonym")
         with connection.cursor() as cursor:

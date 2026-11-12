@@ -1,6 +1,7 @@
 """The synonym dictionary is loaded at deploy and each change of its content is a version."""
 
 import hashlib
+import json
 import threading
 from importlib import resources
 
@@ -27,6 +28,11 @@ def write(tmp_path, text):
     return path
 
 
+def content_hash(path) -> str:
+    pairs = sorted(read_synonyms(path).items())
+    return hashlib.sha256(json.dumps(pairs).encode()).hexdigest()
+
+
 def version_count(connection) -> int:
     return connection.execute("SELECT count(*) FROM synonym_version").fetchone()[0]
 
@@ -43,7 +49,7 @@ def test_first_load_records_a_version(database_url, tmp_path):
         version = current_dictionary(connection)
 
     assert version is not None
-    assert version.file_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert version.file_sha256 == content_hash(path)
     assert version.entries == 1
     assert version.loaded_at is not None
 
@@ -149,6 +155,14 @@ def test_two_loads_at_once_record_one_version(database_url, tmp_path):
         assert version_count(first) == 1
 
 
+class FakeConnection:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def test_cli_load_synonyms_loads_the_packaged_file(database_url, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", database_url)
 
@@ -159,20 +173,13 @@ def test_cli_load_synonyms_loads_the_packaged_file(database_url, monkeypatch):
         assert entries(connection) == set(expected)
         version = current_dictionary(connection)
     assert version.entries == len(expected)
-    assert version.file_sha256 == hashlib.sha256(SYNONYMS_FILE.read_bytes()).hexdigest()
+    assert version.file_sha256 == content_hash(SYNONYMS_FILE)
 
 
 def test_cli_load_synonyms_connects_to_the_direct_address(monkeypatch):
     pooled = "postgresql://u:p@ep-cool-123-pooler.example.neon.tech/db"
     monkeypatch.setenv("DATABASE_URL", pooled)
     seen = []
-
-    class FakeConnection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
 
     monkeypatch.setattr(database, "connect", lambda url=None: seen.append(url) or FakeConnection())
     monkeypatch.setattr(synonyms_module, "load_synonyms", lambda connection: 0)
@@ -191,3 +198,35 @@ def test_packaged_synonyms_file_is_in_the_installed_package():
     assert resource.is_file()
     with resources.as_file(resource) as path:
         assert isinstance(read_synonyms(path), dict)
+
+
+def test_reordered_lines_and_other_line_endings_add_no_version(database_url, tmp_path):
+    with psycopg.connect(database_url) as connection:
+        load_synonyms(connection, write(tmp_path, TWO_ENTRIES))
+        first = current_dictionary(connection)
+
+        reordered = HEADER + "low rank adaptation,LoRA\nlora,LoRA\n"
+        load_synonyms(connection, write(tmp_path, reordered))
+        path = tmp_path / "crlf.csv"
+        path.write_bytes(TWO_ENTRIES.replace("\n", "\r\n").encode())
+        load_synonyms(connection, path)
+
+        assert version_count(connection) == 1
+        assert current_dictionary(connection) == first
+
+
+def test_cli_load_synonyms_reports_an_invalid_file_in_one_line(monkeypatch, tmp_path, capsys):
+    broken = write(tmp_path, HEADER + "lora,LoRA\nlora,x\n")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
+    monkeypatch.setattr(synonyms_module, "SYNONYMS_FILE", broken)
+    monkeypatch.setattr(
+        synonyms_module, "load_synonyms", lambda c: synonyms_module.read_synonyms(broken)
+    )
+    monkeypatch.setattr(database, "connect", lambda url=None: FakeConnection())
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["load-synonyms"])
+
+    assert str(raised.value).startswith("error: ")
+    assert "\n" not in str(raised.value)
+    assert "lora" in str(raised.value)

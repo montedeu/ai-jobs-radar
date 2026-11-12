@@ -16,7 +16,8 @@ def upgrade() -> None:
     op.execute(
         """
         -- One row per change of the dictionary file's content: loaded_at is the date of the
-        -- change, not of a deploy. The measurement log and the header read the last row.
+        -- change, not of a deploy. The header (#24) and the measurement log (#12) are
+        -- planned to read the last row.
         CREATE TABLE synonym_version (
             id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             loaded_at   timestamptz NOT NULL DEFAULT now(),

@@ -81,10 +81,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "load-synonyms":
         from research_radar import database, synonyms
 
-        # Like full-run, on the direct address: the load holds a lock for its transaction,
-        # and behind Neon's pooler a transaction is not the job's own.
+        # Connects like migrate and check-jobs, which run on the same job.
         with database.connect(database.direct_url(database.database_url())) as connection:
-            count = synonyms.load_synonyms(connection)
+            try:
+                count = synonyms.load_synonyms(connection)
+            except ValueError as error:  # read_synonyms refused the file
+                raise SystemExit(f"error: {error}") from error
         print(f"synonyms loaded: {count} entries")
     elif args.command == "collect":
         from research_radar import collect
