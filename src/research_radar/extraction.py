@@ -164,6 +164,23 @@ class BudgetExceeded(Exception):
     """The batch, with what is already spent, would pass the ceiling."""
 
 
+# The papers a full run is meant to cover: the slices since HISTORY_START, with an id that
+# can be extracted at all. start_run snapshots it; the full-run plan counts it before any
+# run exists.
+SCOPE_SQL = """
+    SELECT p.arxiv_id FROM paper p
+     WHERE p.first_version_date >= %(start)s
+       AND p.arxiv_id ~ %(shape)s
+       AND EXISTS (SELECT 1 FROM paper_category c
+                    WHERE c.arxiv_id = p.arxiv_id AND c.category = ANY(%(slices)s))
+"""
+SCOPE_PARAMS = {
+    "start": HISTORY_START,
+    "shape": f"^{_ARXIV_ID.pattern}$",
+    "slices": list(CATEGORIES),
+}
+
+
 def start_run(
     connection: psycopg.Connection,
     *,
@@ -197,25 +214,14 @@ def start_run(
         ).fetchone()[0]
         if full:
             connection.execute(
-                """
-                INSERT INTO extraction_run_scope (run_id, arxiv_id)
-                SELECT %(run)s, p.arxiv_id FROM paper p
-                 WHERE p.first_version_date >= %(start)s
-                   AND p.arxiv_id ~ %(shape)s
-                   AND EXISTS (SELECT 1 FROM paper_category c
-                                WHERE c.arxiv_id = p.arxiv_id AND c.category = ANY(%(slices)s))
-                """,
-                {
-                    "run": run_id,
-                    "start": HISTORY_START,
-                    "shape": f"^{_ARXIV_ID.pattern}$",
-                    "slices": list(CATEGORIES),
-                },
+                "INSERT INTO extraction_run_scope (run_id, arxiv_id)"
+                " SELECT %(run)s, s.arxiv_id FROM (" + SCOPE_SQL + ") s",
+                {**SCOPE_PARAMS, "run": run_id},
             )
     return run_id
 
 
-def _usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+def estimate_usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
     price_in, price_out = BATCH_PRICES_USD_PER_MTOK[model]
     return (Decimal(input_tokens) * price_in + Decimal(output_tokens) * price_out) / 1_000_000
 
@@ -233,6 +239,15 @@ GIVEN_UP_SQL = """
      WHERE b.run_id = %(run)s AND b.status = 'collected' AND bp.outcome IN ('invalid', 'errored')
      GROUP BY bp.arxiv_id, bp.abstract_hash
     HAVING count(*) >= %(attempts)s
+"""
+
+
+# The papers a run has out in a batch that is not collected: still sending (nobody knows
+# whether it left) or submitted. _due leaves them out; the full-run plan counts them.
+IN_FLIGHT_SQL = """
+    SELECT bp.arxiv_id, bp.abstract_hash, b.id AS batch_id, b.status
+      FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
+     WHERE b.run_id = %(run)s AND b.status IN ('sending', 'submitted')
 """
 
 
@@ -293,7 +308,7 @@ def submit(
             [request for request, _ in todo], model=model, config=config
         )
         # The output is counted at the cap for every paper: the real size is not known before.
-        estimate = _usd(model, input_tokens, len(todo) * config.max_output_tokens)
+        estimate = estimate_usd(model, input_tokens, len(todo) * config.max_output_tokens)
         with connection.transaction():
             # Two submits at once would each see the same spent money and both pass the ceiling.
             connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
@@ -407,10 +422,10 @@ def _due(
             SELECT arxiv_id, abstract_hash FROM paper_extraction
              WHERE run_id = %(run)s AND arxiv_id = ANY(%(ids)s)
             UNION
-            SELECT bp.arxiv_id, bp.abstract_hash
-              FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
-             WHERE b.run_id = %(run)s AND b.status IN ('sending', 'submitted')
-               AND bp.arxiv_id = ANY(%(ids)s)
+            SELECT f.arxiv_id, f.abstract_hash FROM ("""
+            + IN_FLIGHT_SQL
+            + """) f
+             WHERE f.arxiv_id = ANY(%(ids)s)
             UNION
             SELECT g.arxiv_id, g.abstract_hash FROM ("""
             + GIVEN_UP_SQL
@@ -427,7 +442,8 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
     """Stores a finished batch's answers.
 
     Counts "extracted", "mentions", "pending" (not ended yet), "unsent" (stuck in
-    'sending', for a person to sort out), "rejected" (the API refused the batch), "failed"
+    'sending', for a person to sort out), "abandoned" (a stuck batch a person gave up on:
+    never fetched), "rejected" (the API refused the batch), "failed"
     (the paper's request got no usable answer, or none at all because it errored, expired
     or was canceled: no completion mark, so the paper is due again), "stale" (the paper's
     abstract changed since the batch was sent, so the answer is dropped and the paper stays
@@ -452,8 +468,8 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
     status, provider_batch_id, papers = row
     if status == "collected":
         return Counter()
-    if status in ("sending", "rejected"):
-        return Counter({"unsent" if status == "sending" else "rejected": papers})
+    if status in ("sending", "rejected", "abandoned"):
+        return Counter({{"sending": "unsent"}.get(status, status): papers})
     if not client.batch_ended(provider_batch_id):
         return Counter(pending=papers)
     results = list(client.batch_results(provider_batch_id))
@@ -534,7 +550,7 @@ def _store_batch(
            SET status = 'collected', collected_at = now(), actual_cost_usd = %s
          WHERE id = %s
         """,
-        (_usd(model, input_tokens, output_tokens), batch_id),
+        (estimate_usd(model, input_tokens, output_tokens), batch_id),
     )
     return +counter  # drops zero counts
 

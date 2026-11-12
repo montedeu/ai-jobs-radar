@@ -12,7 +12,7 @@ import psycopg
 
 from research_radar import migrate, papers
 from research_radar.arxiv_api import ArxivClient, Paper
-from research_radar.database import connect, database_url, direct_url
+from research_radar.database import connect, database_url, direct_url, require_direct
 from research_radar.job_log import RunSkipped, record_run
 from research_radar.settings import CATEGORIES, HISTORY_START
 
@@ -123,12 +123,9 @@ def _take_collection_lock(connection: psycopg.Connection) -> bool:
 
     arXiv allows one connection for everything this project runs, and the daily job and
     the backfill lock the same rows in opposite orders. The lock is held by the session
-    and goes when the connection closes; behind a pooler a session is not ours, and the
-    lock would be handed to whoever gets the backend next. direct_url() has already left
-    the pooler if it knew how; the refusal here catches the rest.
+    and goes when the connection closes (see database.require_direct for the pooler).
     """
-    if "-pooler" in (connection.info.host or ""):
-        raise RuntimeError("still connected through Neon's pooler; jobs need the direct URL")
+    require_direct(connection)
     return connection.execute("SELECT pg_try_advisory_lock(%s)", (COLLECTION_LOCK,)).fetchone()[0]
 
 

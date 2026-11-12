@@ -6,6 +6,7 @@ previous run. What it has to cover is the snapshot start_run wrote into extracti
 """
 
 import logging
+from dataclasses import dataclass
 
 import psycopg
 
@@ -44,6 +45,49 @@ _STATE = (
      WHERE s.run_id = %(run)s
 """
 )
+
+
+@dataclass(frozen=True)
+class RunState:
+    missing: int  # papers of the scope that still hold the run back
+    given_up: int
+    scope: int
+    # More given up than EXTRACTION_MAX_GIVEN_UP_SHARE of the scope and more than one paper:
+    # promote will not switch to the run, however much else is done.
+    blocked: bool
+
+
+def run_state(connection: psycopg.Connection, run_id: int) -> RunState:
+    """Where a run stands for promote: what is missing, what it gave up on, and whether
+    it is blocked. The one place that applies the blocking limit."""
+    missing, given_up, scope = connection.execute(
+        _STATE, {"run": run_id, "attempts": EXTRACTION_MAX_ATTEMPTS}
+    ).fetchone()
+    return RunState(
+        missing, given_up, scope, given_up > max(1, EXTRACTION_MAX_GIVEN_UP_SHARE * scope)
+    )
+
+
+def _candidates(connection: psycopg.Connection) -> list[int]:
+    """The full runs promote considers, newest first: created after the current one."""
+    rows = connection.execute(
+        """
+        SELECT id FROM extraction_run
+         WHERE is_full AND current_since IS NULL
+           AND created_at > coalesce(
+                 (SELECT created_at FROM extraction_run WHERE id = %s), '-infinity')
+         ORDER BY created_at DESC, id DESC
+        """,
+        (current_run(connection),),
+    ).fetchall()
+    return [run_id for (run_id,) in rows]
+
+
+def head_candidate(connection: psycopg.Connection) -> int | None:
+    """The newest full run promote considers, or None. A run older than it can never be
+    switched to once the head is finished, so only the head is worth finishing."""
+    candidates = _candidates(connection)
+    return candidates[0] if candidates else None
 
 
 def current_run(connection: psycopg.Connection) -> int | None:
@@ -90,28 +134,17 @@ def promote(connection: psycopg.Connection) -> int | None:
     with connection.transaction():
         # Two promotions at once would each look at the same current run.
         connection.execute("SELECT pg_advisory_xact_lock(hashtext('current_run'))")
-        candidates = connection.execute(
-            """
-            SELECT id FROM extraction_run
-             WHERE is_full AND current_since IS NULL
-               AND created_at > coalesce(
-                     (SELECT created_at FROM extraction_run WHERE id = %s), '-infinity')
-             ORDER BY created_at DESC, id DESC
-            """,
-            (current_run(connection),),
-        ).fetchall()
-        for (run_id,) in candidates:
-            missing, given_up, scope = connection.execute(
-                _STATE, {"run": run_id, "attempts": EXTRACTION_MAX_ATTEMPTS}
-            ).fetchone()
-            if missing:
+        candidates = _candidates(connection)
+        for run_id in candidates:
+            state = run_state(connection, run_id)
+            if state.missing:
                 continue
-            if given_up > max(1, EXTRACTION_MAX_GIVEN_UP_SHARE * scope):
+            if state.blocked:
                 log.warning(
                     "run %s covered its scope but gave up on %s of %s papers; not switching",
                     run_id,
-                    given_up,
-                    scope,
+                    state.given_up,
+                    state.scope,
                 )
                 continue
             # Not now(): that is the start of the transaction, and two switches in a
