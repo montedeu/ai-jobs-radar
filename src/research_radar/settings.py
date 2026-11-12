@@ -27,7 +27,12 @@ BATCH_PRICES_USD_PER_MTOK = {
 # uses all of it: a batch is never allowed to cost more than the estimate said.
 EXTRACTION_MAX_OUTPUT_TOKENS = 2048
 
-# How many collected batches may carry a paper, in one run and with the same abstract,
-# without a usable answer before the run gives up on it. A full run does not wait for such
-# a paper to become current, and the daily job does not send it again.
+# How many paid answers of the run, to the paper's current abstract, may be unusable (not
+# in the schema) before the run gives up on the paper: it is not sent again in that run,
+# and a full run does not wait for it to become current. Failures of the API itself (an
+# errored, expired or canceled request) are not counted: nothing was paid for them.
 EXTRACTION_MAX_ATTEMPTS = 3
+
+# A full run does not become current if more than this share of its scope was given up on:
+# that is a broken prompt or model, not a few odd abstracts.
+EXTRACTION_MAX_GIVEN_UP_SHARE = 0.01

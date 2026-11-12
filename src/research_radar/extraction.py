@@ -23,6 +23,7 @@ from research_radar.settings import (
     BATCH_PRICES_USD_PER_MTOK,
     CATEGORIES,
     EXTRACTION_CEILING_USD,
+    EXTRACTION_MAX_ATTEMPTS,
     EXTRACTION_MAX_OUTPUT_TOKENS,
     HISTORY_START,
 )
@@ -41,7 +42,7 @@ EXTRACTION_PROMPT = (
 # characters; an arXiv id has a dot. A new-style id has nothing else, so the swap is
 # reversible. An id of another shape (an old "hep-th/9901001") cannot be sent; submit
 # leaves such papers out.
-_ARXIV_ID = re.compile(r"[0-9]{4}\.[0-9]{4,5}")
+ARXIV_ID = re.compile(r"[0-9]{4}\.[0-9]{4,5}")
 
 
 def prompt_hash() -> str:
@@ -114,6 +115,7 @@ def start_run(
     that come later, or gain a slice later, are not in it; the daily job sends them to
     the current run.
     """
+    require_idle(connection)
     with connection.transaction():
         run_id = connection.execute(
             "INSERT INTO extraction_run (model, prompt_hash, note, is_full)"
@@ -133,11 +135,10 @@ def start_run(
                 {
                     "run": run_id,
                     "start": HISTORY_START,
-                    "shape": f"^{_ARXIV_ID.pattern}$",
+                    "shape": f"^{ARXIV_ID.pattern}$",
                     "slices": list(CATEGORIES),
                 },
             )
-    connection.commit()
     return run_id
 
 
@@ -146,7 +147,22 @@ def _usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
     return (Decimal(input_tokens) * price_in + Decimal(output_tokens) * price_out) / 1_000_000
 
 
-def _require_idle(connection: psycopg.Connection) -> None:
+# The papers a run has given up on, with the hash of the abstract the attempts were made on:
+# those with EXTRACTION_MAX_ATTEMPTS paid, unusable answers to the abstract they have now.
+# One grouped pass over the run's batches. _due and runs.py both use it, so a paper the
+# full run stops waiting for is also one the daily job stops paying for.
+GIVEN_UP_SQL = """
+    SELECT bp.arxiv_id, bp.abstract_hash
+      FROM extraction_batch b
+      JOIN extraction_batch_paper bp ON bp.batch_id = b.id
+      JOIN paper p ON p.arxiv_id = bp.arxiv_id AND p.abstract_hash = bp.abstract_hash
+     WHERE b.run_id = %(run)s AND b.status = 'collected' AND bp.outcome = 'invalid'
+     GROUP BY bp.arxiv_id, bp.abstract_hash
+    HAVING count(*) >= %(attempts)s
+"""
+
+
+def require_idle(connection: psycopg.Connection) -> None:
     # Both steps roll their own work back on failure; with the caller's transaction open
     # that would take the caller's work with it.
     if connection.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
@@ -180,13 +196,13 @@ def submit(
     sent is always the hash of what was sent. Returns None when there is nothing to send.
     Raises BudgetExceeded, before anything is sent, when the batch's most expensive outcome
     plus what is spent passes the ceiling. Ids of a shape that cannot be sent (see
-    _ARXIV_ID) are left out of the batch and logged as a warning.
+    ARXIV_ID) are left out of the batch and logged as a warning.
 
     The batch is recorded as 'sending' before it is sent: a failure after that leaves the
     row, counted in the budget, instead of a paid batch nobody knows about. Only a refusal
     that certainly created nothing (BatchRejected) takes the money back and frees the papers.
     """
-    _require_idle(connection)
+    require_idle(connection)
     arxiv_ids = _supported(arxiv_ids)
     if not arxiv_ids:
         return None
@@ -252,7 +268,7 @@ def submit(
 def _supported(arxiv_ids: Sequence[str]) -> list[str]:
     """The ids of a shape that can be sent; the others are left out and logged."""
     unique = list(dict.fromkeys(arxiv_ids))
-    supported = {i for i in unique if _ARXIV_ID.fullmatch(i)}
+    supported = {i for i in unique if ARXIV_ID.fullmatch(i)}
     if len(supported) < len(unique):
         unsupported = [i for i in unique if i not in supported]
         log.warning("not sent, arXiv id of an unsupported shape: %s", ", ".join(unsupported))
@@ -298,8 +314,13 @@ def _due(
               FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
              WHERE b.run_id = %(run)s AND b.status IN ('sending', 'submitted')
                AND bp.arxiv_id = ANY(%(ids)s)
+            UNION
+            SELECT g.arxiv_id, g.abstract_hash FROM ("""
+            + GIVEN_UP_SQL
+            + """) g
+             WHERE g.arxiv_id = ANY(%(ids)s)
             """,
-            {"run": run_id, "ids": ids},
+            {"run": run_id, "ids": ids, "attempts": EXTRACTION_MAX_ATTEMPTS},
         ).fetchall()
     )
     return [stored[i] for i in ids if (i, stored[i][1]) not in taken]
@@ -321,7 +342,7 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
     The network is read first, with no transaction and no lock; the database is written in
     one short transaction after, so a slow download holds nothing.
     """
-    _require_idle(connection)
+    require_idle(connection)
     with connection.transaction():
         row = connection.execute(
             "SELECT status, provider_batch_id,"
@@ -390,13 +411,23 @@ def _store_batch(
         seen.add(result.arxiv_id)
         if result.mentions is None:
             counter["failed"] += 1
+            # A request the API errored, expired or canceled has no tokens (see
+            # result_from_batch_entry); an answer that was paid for has some. Only the
+            # second counts toward giving up on the paper.
+            outcome = "invalid" if result.input_tokens + result.output_tokens else "unanswered"
         elif current.get(result.arxiv_id) != sent[result.arxiv_id]:
             # The abstract changed after the send; a batch sent for the newer one may be
             # stored already, and this answer must not replace it.
             counter["stale"] += 1
+            outcome = "stale"
         else:
             counter["extracted"] += 1
             counter["mentions"] += _store(connection, run_id, sent[result.arxiv_id], result)
+            outcome = "extracted"
+        connection.execute(
+            "UPDATE extraction_batch_paper SET outcome = %s WHERE batch_id = %s AND arxiv_id = %s",
+            (outcome, batch_id, result.arxiv_id),
+        )
     connection.execute(
         """
         UPDATE extraction_batch
@@ -480,7 +511,7 @@ _REFUSED_BEFORE_CREATING = frozenset({400, 401, 403, 404, 409, 413, 422, 429})
 
 
 def _custom_id(arxiv_id: str) -> str:
-    if not _ARXIV_ID.fullmatch(arxiv_id):
+    if not ARXIV_ID.fullmatch(arxiv_id):
         raise BatchRejected(f"cannot send arXiv id {arxiv_id!r}: not a new-style id")
     return arxiv_id.replace(".", "_")
 

@@ -30,6 +30,18 @@ def upgrade() -> None:
             arxiv_id text   NOT NULL REFERENCES paper ON DELETE CASCADE,
             PRIMARY KEY (run_id, arxiv_id)
         );
+
+        -- What became of each paper of a collected batch. 'invalid' is an answer that was
+        -- paid for and is not in the schema; 'unanswered' is a request the API errored,
+        -- expired or canceled, which costs nothing. Only 'invalid' counts toward giving
+        -- up on a paper. NULL: the batch is not collected, or was before this column.
+        ALTER TABLE extraction_batch_paper
+            ADD COLUMN outcome text
+            CHECK (outcome IN ('extracted', 'invalid', 'unanswered', 'stale'));
+
+        -- The check for giving up looks at a run's batches and at a paper's rows.
+        CREATE INDEX extraction_batch_run ON extraction_batch (run_id);
+        CREATE INDEX extraction_batch_paper_arxiv_id ON extraction_batch_paper (arxiv_id);
         """
     )
 
@@ -37,6 +49,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute(
         """
+        DROP INDEX extraction_batch_paper_arxiv_id, extraction_batch_run;
+        ALTER TABLE extraction_batch_paper DROP COLUMN outcome;
         DROP TABLE extraction_run_scope;
         ALTER TABLE extraction_run DROP COLUMN current_since, DROP COLUMN is_full;
         """

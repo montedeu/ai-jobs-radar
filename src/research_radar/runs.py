@@ -5,27 +5,47 @@ moment it started (docs/adr/0004); until then the service keeps answering from t
 previous run. What it has to cover is the snapshot start_run wrote into extraction_run_scope.
 """
 
+import logging
+
 import psycopg
 
-from research_radar.extraction import _require_idle
-from research_radar.settings import EXTRACTION_MAX_ATTEMPTS
+from research_radar.extraction import GIVEN_UP_SQL, require_idle
+from research_radar.settings import EXTRACTION_MAX_ATTEMPTS, EXTRACTION_MAX_GIVEN_UP_SHARE
+
+log = logging.getLogger(__name__)
 
 # The papers of a run's snapshot that still hold the switch back: no completion mark, and
-# not given up on. A paper is given up on after EXTRACTION_MAX_ATTEMPTS collected batches
-# of the run carried its current abstract without a usable answer; an older abstract's
-# attempts do not count, the text is another one.
-_MISSING = """
+# not given up on (see extraction.GIVEN_UP_SQL).
+_MISSING = (
+    """
     SELECT s.arxiv_id
-      FROM extraction_run_scope s JOIN paper p USING (arxiv_id)
-     WHERE s.run_id = %(run)s
+      FROM extraction_run_scope s
+      LEFT JOIN ("""
+    + GIVEN_UP_SQL
+    + """) g USING (arxiv_id)
+     WHERE s.run_id = %(run)s AND g.arxiv_id IS NULL
        AND NOT EXISTS (SELECT 1 FROM paper_extraction e
                         WHERE e.run_id = s.run_id AND e.arxiv_id = s.arxiv_id)
-       AND (SELECT count(*)
-              FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
-             WHERE b.run_id = s.run_id AND b.status = 'collected'
-               AND bp.arxiv_id = s.arxiv_id AND bp.abstract_hash = p.abstract_hash
-           ) < %(attempts)s
 """
+)
+
+# Whether the run is unfinished, how many papers of its scope it gave up on, and the size
+# of the scope.
+_STATE = (
+    """
+    SELECT EXISTS ("""
+    + _MISSING
+    + """),
+           (SELECT count(*)
+              FROM extraction_run_scope s JOIN ("""
+    + GIVEN_UP_SQL
+    + """) g USING (arxiv_id)
+             WHERE s.run_id = %(run)s
+               AND NOT EXISTS (SELECT 1 FROM paper_extraction e
+                                WHERE e.run_id = s.run_id AND e.arxiv_id = s.arxiv_id)),
+           (SELECT count(*) FROM extraction_run_scope WHERE run_id = %(run)s)
+"""
+)
 
 
 def current_run(connection: psycopg.Connection) -> int | None:
@@ -40,19 +60,23 @@ def current_run(connection: psycopg.Connection) -> int | None:
 def missing_papers(connection: psycopg.Connection, run_id: int) -> list[str]:
     """The papers of the run's snapshot that keep it from becoming current, by arxiv_id.
 
-    A paper counts as finished whatever its abstract hash is now: extracting it again after
-    a change is the daily job's work.
+    Papers the run gave up on are not listed. A paper counts as finished whatever its
+    abstract hash is now: extracting it again after a change is the daily job's work.
+    Only a full run has a scope; a pilot run raises ValueError.
     """
     row = connection.execute(
         f"""
-        SELECT array(SELECT m.arxiv_id FROM ({_MISSING}) m ORDER BY m.arxiv_id COLLATE "C")
+        SELECT r.is_full,
+               array(SELECT m.arxiv_id FROM ({_MISSING}) m ORDER BY m.arxiv_id COLLATE "C")
           FROM extraction_run r WHERE r.id = %(run)s
         """,
         {"run": run_id, "attempts": EXTRACTION_MAX_ATTEMPTS},
     ).fetchone()
     if row is None:
         raise LookupError(f"no extraction run {run_id}")
-    return row[0]
+    if not row[0]:
+        raise ValueError(f"run {run_id} is not a full run: only a full run has a scope")
+    return row[1]
 
 
 def promote(connection: psycopg.Connection) -> int | None:
@@ -60,9 +84,11 @@ def promote(connection: psycopg.Connection) -> int | None:
 
     Only a full run created after the current one is considered, so an older run never
     takes the place of a newer one, and a run that is current is not switched to again.
-    The connection must have no transaction open, as in extraction.
+    A run that gave up on more than EXTRACTION_MAX_GIVEN_UP_SHARE of its scope is not
+    switched to: that is a failure of the run, not of a few papers. The connection must have
+    no transaction open, as in extraction.
     """
-    _require_idle(connection)
+    require_idle(connection)
     with connection.transaction():
         # Two promotions at once would each look at the same current run.
         connection.execute("SELECT pg_advisory_xact_lock(hashtext('current_run'))")
@@ -77,15 +103,24 @@ def promote(connection: psycopg.Connection) -> int | None:
             (current_run(connection),),
         ).fetchall()
         for (run_id,) in candidates:
-            unfinished = connection.execute(
-                f"SELECT EXISTS ({_MISSING})", {"run": run_id, "attempts": EXTRACTION_MAX_ATTEMPTS}
-            ).fetchone()[0]
-            if not unfinished:
-                # Not now(): that is the start of the transaction, and two switches in a
-                # row must still be ordered.
-                connection.execute(
-                    "UPDATE extraction_run SET current_since = clock_timestamp() WHERE id = %s",
-                    (run_id,),
+            unfinished, given_up, scope = connection.execute(
+                _STATE, {"run": run_id, "attempts": EXTRACTION_MAX_ATTEMPTS}
+            ).fetchone()
+            if unfinished:
+                continue
+            if given_up > EXTRACTION_MAX_GIVEN_UP_SHARE * scope:
+                log.warning(
+                    "run %s covered its scope but gave up on %s of %s papers; not switching",
+                    run_id,
+                    given_up,
+                    scope,
                 )
-                return run_id
+                continue
+            # Not now(): that is the start of the transaction, and two switches in a
+            # row must still be ordered.
+            connection.execute(
+                "UPDATE extraction_run SET current_since = clock_timestamp() WHERE id = %s",
+                (run_id,),
+            )
+            return run_id
     return None

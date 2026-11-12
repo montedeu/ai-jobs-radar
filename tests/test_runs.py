@@ -41,8 +41,8 @@ def mark_done(connection, run_id, *arxiv_ids):
         )
 
 
-def fail_attempts(connection, run_id, arxiv_id, count, *, abstract_hash="h"):
-    """Collected batches that carried the paper and got no usable answer."""
+def fail_attempts(connection, run_id, arxiv_id, count, *, abstract_hash="h", outcome="invalid"):
+    """Collected batches that carried the paper and ended with the given outcome for it."""
     for _ in range(count):
         batch_id = connection.execute(
             "INSERT INTO extraction_batch (run_id, status, estimated_cost_usd)"
@@ -50,10 +50,18 @@ def fail_attempts(connection, run_id, arxiv_id, count, *, abstract_hash="h"):
             (run_id,),
         ).fetchone()[0]
         connection.execute(
-            "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash)"
-            " VALUES (%s, %s, %s)",
-            (batch_id, arxiv_id, abstract_hash),
+            "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash, outcome)"
+            " VALUES (%s, %s, %s, %s)",
+            (batch_id, arxiv_id, abstract_hash, outcome),
         )
+
+
+def add_filler(connection, count):
+    """Papers that make the scope big enough for a given-up paper to be under the share."""
+    ids = [f"2512.{n:05d}" for n in range(count)]
+    for arxiv_id in ids:
+        add_paper(connection, arxiv_id)
+    return ids
 
 
 CL = ["2511.00001", "2511.00002", "2511.00003"]
@@ -189,14 +197,15 @@ def test_a_paper_whose_abstract_changed_after_the_mark_is_still_covered(connecti
 
 
 def test_paper_given_up_on_does_not_block_the_switch(connection, papers):
+    filler = add_filler(connection, 97)  # 100 papers in the scope: one given up is 1%
     run = new_run(connection)
-    mark_done(connection, run, *CL[:2])
+    mark_done(connection, run, *CL[:2], *filler)
     fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS)
     assert missing_papers(connection, run) == []
     assert promote(connection) == run
 
 
-def test_paper_with_fewer_failed_attempts_still_blocks_the_switch(connection, papers):
+def test_paper_with_fewer_invalid_answers_still_blocks_the_switch(connection, papers):
     run = new_run(connection)
     mark_done(connection, run, *CL[:2])
     fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS - 1)
@@ -204,11 +213,32 @@ def test_paper_with_fewer_failed_attempts_still_blocks_the_switch(connection, pa
     assert promote(connection) is None
 
 
-def test_failed_attempts_on_an_older_abstract_do_not_count(connection, papers):
+def test_batches_the_api_failed_are_not_attempts(connection, papers):
+    filler = add_filler(connection, 97)
+    run = new_run(connection)
+    mark_done(connection, run, *CL[:2], *filler)
+    for outcome in ("unanswered", "stale", "extracted", None):
+        fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS, outcome=outcome)
+    assert missing_papers(connection, run) == [CL[2]]
+    assert promote(connection) is None
+
+
+def test_invalid_answers_on_an_older_abstract_do_not_count(connection, papers):
     run = new_run(connection)
     mark_done(connection, run, *CL[:2])
     fail_attempts(connection, run, CL[2], EXTRACTION_MAX_ATTEMPTS, abstract_hash="old")
     assert missing_papers(connection, run) == [CL[2]]
+
+
+def test_run_with_more_than_one_percent_given_up_does_not_become_current(connection, papers):
+    filler = add_filler(connection, 97)
+    run = new_run(connection)
+    mark_done(connection, run, CL[0], *filler)
+    for arxiv_id in CL[1:]:
+        fail_attempts(connection, run, arxiv_id, EXTRACTION_MAX_ATTEMPTS)
+    assert missing_papers(connection, run) == []
+    assert promote(connection) is None
+    assert current_run(connection) is None
 
 
 def test_full_run_over_an_empty_scope_becomes_current(connection):
@@ -237,6 +267,17 @@ def test_promote_refuses_a_connection_with_a_transaction_open(connection, papers
 def test_missing_papers_are_sorted_by_arxiv_id(connection, papers):
     run = new_run(connection)
     assert missing_papers(connection, run) == sorted(CL)
+
+
+def test_missing_papers_of_a_pilot_run_is_an_error(connection, papers):
+    pilot = new_run(connection, full=False)
+    with pytest.raises(ValueError, match="full"):
+        missing_papers(connection, pilot)
+
+
+def test_start_run_refuses_a_connection_with_a_transaction_open(connection):
+    with connection.transaction(), pytest.raises(ValueError, match="transaction"):
+        new_run(connection)
 
 
 def test_missing_papers_of_an_unknown_run_is_an_error(connection, papers):
