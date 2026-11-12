@@ -430,7 +430,7 @@ def test_a_broken_batch_does_not_stop_the_others_or_the_switch(connection, curre
         extract_daily(connection, factory(model), details=details)
 
     assert list(details["batch_errors"]) == [str(broken)]
-    assert "results expired" in details["batch_errors"][str(broken)]
+    assert details["batch_errors"][str(broken)] == "RuntimeError"
     assert details["batches_collected"] == 1
     assert details["promoted"] == full
     # The paper was still sent, after the switch, to the new current run.

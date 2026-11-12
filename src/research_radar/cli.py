@@ -15,6 +15,7 @@ COMMANDS = {
     "check-jobs": "fail unless a collection job could start (no request to arXiv)",
     "frequencies": "write the shares of the top entities of an extraction run to a Markdown file",
     "full-run": "estimate and, with --confirm, send the whole history to extraction (paid)",
+    "abandon-batch": "give up a batch stuck in 'sending' or 'submitted' (its cost stays spent)",
     "serve-mcp": "serve the MCP server on $PORT",
 }
 
@@ -24,6 +25,39 @@ def _positive(text: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return number
+
+
+def _abandon_batch(connection, extraction, batch_id: int, confirm: bool) -> None:
+    row = connection.execute(
+        "SELECT run_id, status, estimated_cost_usd,"
+        " (SELECT count(*) FROM extraction_batch_paper WHERE batch_id = b.id)"
+        " FROM extraction_batch b WHERE id = %s",
+        (batch_id,),
+    ).fetchone()
+    if row is None:
+        raise SystemExit(f"error: no extraction batch {batch_id}")
+    run_id, status, estimate, papers = row
+    print(
+        f"Batch {batch_id} of run {run_id}: {status}, {papers} papers, estimated ${estimate}; "
+        "the estimate stays in the spent total."
+    )
+    if status not in ("sending", "submitted"):
+        raise SystemExit(f"error: only a sending or submitted batch can be abandoned, not {status}")
+    if not confirm:
+        print(
+            "Nothing was changed. First check the Anthropic console for a batch that was "
+            "created: if this one did leave, giving it up sends its papers again and they are "
+            "paid for twice. Run again with --confirm to give it up."
+        )
+        return
+    try:
+        extraction.abandon_batch(connection, batch_id)
+    except ValueError as error:
+        raise SystemExit(f"error: {error}") from error
+    print(
+        f"Abandoned batch {batch_id}: its {papers} papers are due again. If the batch did "
+        "leave, they will be sent again and paid for twice."
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -65,6 +99,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="with --confirm: give up the batches left in 'sending' (their cost stays in the "
         "spent total) and continue",
+    )
+    abandon = parsers["abandon-batch"]
+    abandon.add_argument("batch_id", type=_positive, help="the extraction batch id")
+    abandon.add_argument(
+        "--confirm", action="store_true", help="give the batch up; without it only describe it"
     )
     args = parser.parse_args(argv)
     if args.command == "full-run":
@@ -153,6 +192,13 @@ def main(argv: list[str] | None = None) -> None:
                 raise SystemExit(f"error: {error}") from error
         if plan.refused:
             raise SystemExit(1)
+    elif args.command == "abandon-batch":
+        from research_radar import database, extraction
+
+        with database.connect(database.direct_url(database.database_url())) as connection:
+            # The extraction steps refuse a connection with a transaction open.
+            connection.autocommit = True
+            _abandon_batch(connection, extraction, args.batch_id, args.confirm)
     elif args.command == "serve-mcp":
         from research_radar import mcp_server
 

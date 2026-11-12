@@ -271,6 +271,38 @@ def spent_usd(connection: psycopg.Connection) -> Decimal:
     ).fetchone()[0]
 
 
+def abandon_batch(connection: psycopg.Connection, batch_id: int) -> int:
+    """Gives up a batch that is 'sending' or 'submitted'; returns the number of its papers.
+
+    The batch stays in spent_usd at its estimate: nobody knows whether it left, or what a
+    submitted one will still cost. Its papers stop counting as in flight, so they are due
+    again; if the batch did go out, they are paid for twice. collect leaves it alone.
+    Raises LookupError for an unknown batch and ValueError for one in another status.
+    The connection must have no transaction open.
+    """
+    require_idle(connection)
+    with connection.transaction():
+        # The update takes the row lock, so a collector storing the batch at this moment
+        # finishes first (and then this finds it 'collected') or sees 'abandoned' after.
+        given_up = connection.execute(
+            "UPDATE extraction_batch SET status = 'abandoned'"
+            " WHERE id = %s AND status IN ('sending', 'submitted') RETURNING id",
+            (batch_id,),
+        ).fetchone()
+        if given_up is None:
+            row = connection.execute(
+                "SELECT status FROM extraction_batch WHERE id = %s", (batch_id,)
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"no extraction batch {batch_id}")
+            raise ValueError(
+                f"batch {batch_id} is {row[0]}; only a sending or submitted batch can be abandoned"
+            )
+        return connection.execute(
+            "SELECT count(*) FROM extraction_batch_paper WHERE batch_id = %s", (batch_id,)
+        ).fetchone()[0]
+
+
 def submit(
     connection: psycopg.Connection,
     client: ModelClient,

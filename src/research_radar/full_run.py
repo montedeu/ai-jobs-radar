@@ -71,8 +71,8 @@ class FullRunPlan:
 
 
 _RESTART_HINT = (
-    "Run again with --confirm --restart to start a new full run: it is newer, so the old "
-    "one never becomes current."
+    "Run again with --confirm --restart to start a new full run, which pays for the whole "
+    "history again."
 )
 _ABANDON_HINT = (
     "First check the Anthropic console for a batch that was created: the cost of a batch "
@@ -304,7 +304,9 @@ def _run_locked(
             raise
     out(
         f"Done: sent {sent}, skipped {skipped}, left 0. A skipped part had everything "
-        "already in flight or done."
+        "already in flight or done. After the daily job has collected the sent batches, run "
+        "the command again until the run becomes current: a batch that failed or went "
+        "stale leaves its papers to send."
     )
     return found
 
@@ -318,11 +320,18 @@ def _abandon_sending(
         connection, head, model, extraction.config_hash(config, model)
     ):
         return
-    given_up = connection.execute(
-        "UPDATE extraction_batch SET status = 'abandoned'"
-        " WHERE run_id = %s AND status = 'sending' RETURNING id",
+    stuck = connection.execute(
+        "SELECT id FROM extraction_batch WHERE run_id = %s AND status = 'sending' ORDER BY id",
         (head,),
     ).fetchall()
+    given_up = []
+    for (batch_id,) in stuck:
+        try:
+            extraction.abandon_batch(connection, batch_id)
+        except ValueError:
+            # A collector got to the batch first, so it is not stuck any more.
+            continue
+        given_up.append(batch_id)
     if given_up:
         out(
             f"Abandoned {len(given_up)} batches of run {head} left in 'sending'; their cost "

@@ -14,7 +14,7 @@ import psycopg
 
 from research_radar import extraction, runs, settings
 from research_radar.database import connect, database_url, direct_url, require_direct
-from research_radar.job_log import RunSkipped, record_run
+from research_radar.job_log import RunSkipped, error_summary, record_run
 from research_radar.settings import (
     EXTRACTION_DAILY_MAX_PAPERS,
     EXTRACTION_MAX_ATTEMPTS,
@@ -107,7 +107,8 @@ def _collect_all(
             except RunSkipped:
                 raise
             except Exception as error:
-                errors[str(batch_id)] = f"{type(error).__name__}: {error}"
+                # A failure's text can carry a host or a key, and the service shows this row.
+                errors[str(batch_id)] = error_summary(error)
                 continue
             collected += counts
             ended += any(counts[key] for key in ("extracted", "failed", "stale"))
@@ -158,6 +159,7 @@ def extract_daily(
         current_run=None,
         due=0,
         gave_up=0,
+        full_run_missing=None,
         submitted=0,
         submitted_batches=[],
     )
@@ -166,6 +168,10 @@ def extract_daily(
         _collect_all(connection, client, details)
         details["promoted"] = runs.promote(connection)
         run_id = details["current_run"] = runs.current_run(connection)
+        # The log then shows how far the full run still is from becoming current.
+        head = runs.head_candidate(connection)
+        if head is not None:
+            details["full_run_missing"] = runs.run_state(connection, head).missing
         if run_id is not None:
             due, details["gave_up"] = _due(connection, run_id)
             details["due"] = len(due)

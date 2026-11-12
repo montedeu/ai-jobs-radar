@@ -14,7 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from research_radar.database import connect
 from research_radar.history_summary import HistorySummary, history_summary
-from research_radar.job_log import JobRun, latest_runs
+from research_radar.job_log import JobRun, error_summary, latest_runs
 
 HEALTH_PATH = "/health"
 
@@ -38,19 +38,23 @@ class StatusUnavailable(Exception):
     """The database cannot be reached. The message is the error type and SQLSTATE only."""
 
 
-def _error_summary(error: Exception) -> str:
-    # psycopg messages can name the database host and user, so only the type and SQLSTATE go out.
-    sqlstate = error.sqlstate if isinstance(error, psycopg.Error) else None
-    name = type(error).__name__
-    return f"{name} (SQLSTATE {sqlstate})" if sqlstate else name
+def _type_only(text: str) -> str:
+    # "Type: message" and "Type (SQLSTATE x)" both begin with the type.
+    return text.split(":", 1)[0]
 
 
 def _without_error_text(run: JobRun) -> JobRun:
-    # The job log keeps the full text for the developer; the answer names only the type.
-    error = run.details.get("error")
-    if not isinstance(error, str):
-        return run
-    return run.model_copy(update={"details": {**run.details, "error": error.split(":", 1)[0]}})
+    # The job log may hold full texts (rows written before batch errors were cut down); the
+    # answer names only the type.
+    details = dict(run.details)
+    if isinstance(details.get("error"), str):
+        details["error"] = _type_only(details["error"])
+    if isinstance(details.get("batch_errors"), dict):
+        details["batch_errors"] = {
+            batch: _type_only(text) if isinstance(text, str) else text
+            for batch, text in details["batch_errors"].items()
+        }
+    return run.model_copy(update={"details": details})
 
 
 @server.tool()
@@ -72,9 +76,9 @@ def service_status() -> ServiceStatus:
             try:
                 return ServiceStatus(latest_runs=runs, history=history_summary(connection))
             except Exception as error:
-                return ServiceStatus(latest_runs=runs, history_error=_error_summary(error))
+                return ServiceStatus(latest_runs=runs, history_error=error_summary(error))
     except psycopg.Error as error:
-        raise StatusUnavailable(_error_summary(error)) from None
+        raise StatusUnavailable(error_summary(error)) from None
 
 
 @server.custom_route(HEALTH_PATH, methods=["GET"])
