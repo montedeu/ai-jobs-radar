@@ -1,3 +1,4 @@
+import importlib.util
 import os
 
 import pytest
@@ -65,3 +66,21 @@ def no_real_arxiv(monkeypatch):
         raise AssertionError("a test tried to reach arXiv")
 
     monkeypatch.setattr("httpx.Client.get", refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_real_model(monkeypatch):
+    """A test that forgets to pass a fake model client fails instead of calling the API.
+
+    The client is refused where it is built, so neither our wrapper nor the SDK's own
+    client can open a connection. The SDK import is optional: the guard must not break
+    collection where ``anthropic`` is not installed.
+    """
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a test tried to reach the Anthropic API")
+
+    monkeypatch.setattr("research_radar.extraction.AnthropicModelClient.__init__", refuse)
+    if importlib.util.find_spec("anthropic"):
+        monkeypatch.setattr("anthropic.Anthropic.__init__", refuse)
+        monkeypatch.setattr("anthropic.AsyncAnthropic.__init__", refuse)
