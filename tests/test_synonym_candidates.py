@@ -122,6 +122,41 @@ def test_ignores_model_variants():
     assert find_pairs(abstract) == []
 
 
+def test_keeps_pairs_whose_normal_form_is_only_a_substring_of_the_other():
+    abstract = "Data Augmentation (DA), Relation Extraction (RE) and Task Arithmetic (TA)."
+
+    assert find_pairs(abstract) == [
+        Pair("Data Augmentation", "DA"),
+        Pair("Relation Extraction", "RE"),
+        Pair("Task Arithmetic", "TA"),
+    ]
+
+
+def test_ignores_expansion_with_words_after_the_last_letter():
+    assert find_pairs("RL (reinforcement learning from human feedback) is used") == []
+
+
+def test_cuts_words_after_the_last_letter_from_the_expansion_before_the_parenthesis():
+    assert find_pairs("Direct Preference Optimization algorithm (DPO)") == [
+        Pair("Direct Preference Optimization", "DPO")
+    ]
+
+
+def test_strips_quotes_around_the_expansion():
+    assert find_pairs('a method called "Low-Rank Adaptation" (LoRA)') == [
+        Pair("Low-Rank Adaptation", "LoRA")
+    ]
+
+
+def test_square_bracket_citations_are_not_part_of_the_pair():
+    abstract = "supervised fine-tuning [12] (SFT) and Low-Rank Adaptation [3] (LoRA)"
+
+    assert find_pairs(abstract) == [
+        Pair("supervised fine-tuning", "SFT"),
+        Pair("Low-Rank Adaptation", "LoRA"),
+    ]
+
+
 def test_finds_pair_inside_enclosing_parenthesis():
     assert find_pairs("tuning (low-rank adaptation (LoRA)) works") == [
         Pair("low-rank adaptation", "LoRA")
@@ -148,6 +183,14 @@ def test_parenthesis_inside_the_expansion_is_skipped():
 
 def test_one_pair_per_paper_counts_once(database_url):
     abstract = "Low-Rank Adaptation (LoRA) works. We use Low-Rank Adaptation (LoRA) again."
+
+    candidates = collect(database_url, [abstract])
+
+    assert candidates.pairs == {"lora": ("Low-Rank Adaptation", 1)}
+
+
+def test_one_paper_with_two_spellings_of_a_pair_counts_once(database_url):
+    abstract = "Low-Rank Adaptation (LoRA) works. low-rank adaptation (LoRA) again."
 
     candidates = collect(database_url, [abstract])
 
@@ -198,12 +241,66 @@ def test_pair_with_only_the_abbreviation_in_synonym_table_is_still_a_candidate(d
     assert candidates.pairs == {"lora": ("Low-Rank Adaptation", 1)}
 
 
-def test_pair_whose_two_sides_have_different_names_is_still_a_candidate(database_url):
+def test_pair_whose_two_sides_have_different_names_is_a_conflict(database_url):
     covered = [("lora", "LoRA"), ("low rank adaptation", "Low-Rank Adaptation")]
 
     candidates = collect(database_url, [LORA_FULL], synonyms=covered)
 
-    assert candidates.pairs == {"lora": ("Low-Rank Adaptation", 1)}
+    assert candidates.pairs == {}
+    assert candidates.conflicts == {"lora": {"Low-Rank Adaptation": 1, "LoRA": 0}}
+
+
+def test_candidate_takes_the_name_the_dictionary_already_has(database_url):
+    candidates = collect(database_url, [LORA_FULL], synonyms=[("lora", "LoRA")])
+
+    assert candidates.existing_names == {"lora": "LoRA"}
+
+
+def test_candidate_rows_use_the_existing_name_for_both_keys(tmp_path):
+    candidates = Candidates(
+        pairs={"lora": ("Low-Rank Adaptation", 2)}, conflicts={}, existing_names={"lora": "LoRA"}
+    )
+    path = tmp_path / "candidates.csv"
+
+    write_candidates_csv(candidates, path)
+
+    assert read_rows(path) == [
+        HEADER,
+        ["lora", "LoRA", "2"],
+        ["low rank adaptation", "LoRA", "2"],
+    ]
+
+
+def test_candidate_takes_the_existing_name_of_the_expansion(database_url):
+    synonyms = [("low rank adaptation", "Low-Rank Adaptation")]
+
+    candidates = collect(database_url, [LORA_FULL], synonyms=synonyms)
+
+    assert candidates.existing_names == {"lora": "Low-Rank Adaptation"}
+
+
+def test_conflict_counts_pairs_the_dictionary_covers(database_url):
+    covered = [("peft", "PEFT"), ("parameter efficient fine tuning", "PEFT")]
+
+    candidates = collect(database_url, [PEFT_EFFICIENT, PEFT_PROMPT], synonyms=covered)
+
+    assert candidates.pairs == {}
+    assert candidates.conflicts == {
+        "peft": {"parameter-efficient fine-tuning": 1, "prompt engineering fine tuning": 1}
+    }
+
+
+def test_dictionary_expansion_against_another_one_in_the_corpus_is_a_conflict(database_url):
+    synonyms = [("rag", "retrieval-augmented generation")]
+
+    candidates = collect(
+        database_url, ["RAG (red-team augmented generation) is a test."], synonyms=synonyms
+    )
+
+    assert candidates.pairs == {}
+    assert candidates.conflicts == {
+        "rag": {"red-team augmented generation": 1, "retrieval-augmented generation": 0}
+    }
 
 
 def test_conflict_is_shown_when_only_the_abbreviation_is_in_synonym_table(database_url):
