@@ -14,11 +14,13 @@ HISTORY_START = date(2025, 11, 1)
 EXTRACTION_MODEL = "claude-haiku-5-5"
 EXTRACTION_CEILING_USD = Decimal(20)
 
-# Message Batches price, USD per million tokens, Claude Haiku 5.5, prompts up to 100,000
-# tokens (an abstract is far below): half of the standard $0.10 / $0.50.
+# Message Batches price per model, USD per million tokens (input, output). Claude Haiku 5.5
+# for prompts up to 100,000 tokens (an abstract is far below): half of the standard
+# $0.10 / $0.50. A run of a model that is not here cannot be submitted: its cost is unknown.
 # Source: https://platform.claude.com/docs/en/about-claude/pricing#batch-processing
-BATCH_INPUT_USD_PER_MTOK = Decimal("0.05")
-BATCH_OUTPUT_USD_PER_MTOK = Decimal("0.25")
+BATCH_PRICES_USD_PER_MTOK = {
+    "claude-haiku-5-5": (Decimal("0.05"), Decimal("0.25")),
+}
 
 # Haiku 5.5 thinks by default and thinking counts toward max_tokens, so the cap is well
 # above the few hundred tokens of the mentions. The cost estimate assumes every paper

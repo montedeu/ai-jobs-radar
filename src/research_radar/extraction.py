@@ -5,7 +5,6 @@ the process that sent it may be gone by then. Everything the second step needs i
 database. The model is reached only through ModelClient; tests pass a fake one.
 """
 
-import hashlib
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -17,10 +16,9 @@ from pydantic import ValidationError
 
 from research_radar.mentions import PaperMentions
 from research_radar.normalize import normal_form
-from research_radar.papers import abstract_hash
+from research_radar.papers import abstract_hash, text_hash
 from research_radar.settings import (
-    BATCH_INPUT_USD_PER_MTOK,
-    BATCH_OUTPUT_USD_PER_MTOK,
+    BATCH_PRICES_USD_PER_MTOK,
     EXTRACTION_CEILING_USD,
     EXTRACTION_MAX_OUTPUT_TOKENS,
     EXTRACTION_MODEL,
@@ -35,7 +33,7 @@ EXTRACTION_PROMPT = (
 
 
 def prompt_hash() -> str:
-    return hashlib.sha256(EXTRACTION_PROMPT.encode()).hexdigest()
+    return text_hash(EXTRACTION_PROMPT)
 
 
 @dataclass(frozen=True)
@@ -81,30 +79,28 @@ def start_run(
     return run_id
 
 
-def _usd(input_tokens: int, output_tokens: int) -> Decimal:
-    return (
-        Decimal(input_tokens) * BATCH_INPUT_USD_PER_MTOK
-        + Decimal(output_tokens) * BATCH_OUTPUT_USD_PER_MTOK
-    ) / 1_000_000
+def _usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+    price_in, price_out = BATCH_PRICES_USD_PER_MTOK[model]
+    return (Decimal(input_tokens) * price_in + Decimal(output_tokens) * price_out) / 1_000_000
+
+
+def _require_idle(connection: psycopg.Connection) -> None:
+    # Both steps roll their own work back on failure; with the caller's transaction open
+    # that would take the caller's work with it.
+    if connection.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise ValueError("the connection has a transaction open; commit or roll it back first")
 
 
 def spent_usd(connection: psycopg.Connection) -> Decimal:
-    """Money spent by every run: finished papers, unusable answers, and batches still out.
+    """Money spent by every run, from the batch ledger.
 
-    A batch not yet collected counts at its estimate, which is the most it can cost.
+    A batch that is not collected counts at its estimate, which is the most it can cost,
+    and so does one stuck in 'sending': nobody knows whether it left.
     """
-    input_tokens, output_tokens, pending = connection.execute(
-        """
-        SELECT
-            (SELECT coalesce(sum(input_tokens), 0) FROM paper_extraction)
-                + (SELECT coalesce(sum(unusable_input_tokens), 0) FROM extraction_batch),
-            (SELECT coalesce(sum(output_tokens), 0) FROM paper_extraction)
-                + (SELECT coalesce(sum(unusable_output_tokens), 0) FROM extraction_batch),
-            (SELECT coalesce(sum(estimated_cost_usd), 0) FROM extraction_batch
-              WHERE status = 'submitted')
-        """
-    ).fetchone()
-    return _usd(input_tokens, output_tokens) + pending
+    return connection.execute(
+        "SELECT coalesce(sum(coalesce(actual_cost_usd, estimated_cost_usd)), 0)"
+        " FROM extraction_batch"
+    ).fetchone()[0]
 
 
 def submit(
@@ -119,37 +115,61 @@ def submit(
 
     Returns None when there is nothing to send. Raises BudgetExceeded, before anything is
     sent, when the batch's most expensive outcome plus what is spent passes the ceiling.
+    The batch is recorded as 'sending' before it is sent: a failure after that leaves the
+    row, counted in the budget, instead of a paid batch nobody knows about.
     """
+    _require_idle(connection)
     if not papers:
         return None
-    # Two submits at once would each see the same spent money and both pass the ceiling.
-    connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
-    todo = _not_yet_extracted(connection, run_id, papers)
+    with connection.transaction():
+        model = _run_model(connection, run_id)
+        todo = _not_yet_extracted(connection, run_id, papers)
     if not todo:
-        connection.rollback()
         return None
+    # Counting is slow network work and takes no money; it stays outside the lock below.
+    input_tokens = client.count_tokens(todo)
     # The output is counted at the cap for every paper: the real size is not known before.
-    estimate = _usd(client.count_tokens(todo), len(todo) * EXTRACTION_MAX_OUTPUT_TOKENS)
-    if spent_usd(connection) + estimate > ceiling_usd:
-        connection.rollback()
-        raise BudgetExceeded(f"batch estimated at ${estimate} does not fit under ${ceiling_usd}")
+    estimate = _usd(model, input_tokens, len(todo) * EXTRACTION_MAX_OUTPUT_TOKENS)
+    with connection.transaction():
+        # Two submits at once would each see the same spent money and both pass the ceiling.
+        connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
+        # Another submit may have taken some of the papers while this one was counting.
+        # The estimate then covers more than is sent, which is the safe side.
+        todo = _not_yet_extracted(connection, run_id, todo)
+        if not todo:
+            return None
+        if spent_usd(connection) + estimate > ceiling_usd:
+            raise BudgetExceeded(
+                f"batch estimated at ${estimate} does not fit under ${ceiling_usd}"
+            )
+        batch_id = connection.execute(
+            "INSERT INTO extraction_batch (run_id, estimated_cost_usd) VALUES (%s, %s)"
+            " RETURNING id",
+            (run_id, estimate),
+        ).fetchone()[0]
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash)"
+                " VALUES (%s, %s, %s)",
+                [(batch_id, p.arxiv_id, abstract_hash(p.abstract)) for p in todo],
+            )
     provider_batch_id = client.submit_batch(todo)
-    # The batch is paid for from here on, so the rows that find it again go in at once.
-    batch_id = connection.execute(
-        """
-        INSERT INTO extraction_batch (run_id, provider_batch_id, estimated_cost_usd)
-        VALUES (%s, %s, %s) RETURNING id
-        """,
-        (run_id, provider_batch_id, estimate),
-    ).fetchone()[0]
-    with connection.cursor() as cursor:
-        cursor.executemany(
-            "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash)"
-            " VALUES (%s, %s, %s)",
-            [(batch_id, p.arxiv_id, abstract_hash(p.abstract)) for p in todo],
+    with connection.transaction():
+        connection.execute(
+            "UPDATE extraction_batch SET provider_batch_id = %s, status = 'submitted'"
+            " WHERE id = %s",
+            (provider_batch_id, batch_id),
         )
-    connection.commit()
     return batch_id
+
+
+def _run_model(connection: psycopg.Connection, run_id: int) -> str:
+    row = connection.execute("SELECT model FROM extraction_run WHERE id = %s", (run_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no extraction run {run_id}")
+    if row[0] not in BATCH_PRICES_USD_PER_MTOK:
+        raise ValueError(f"no batch prices for model {row[0]!r}; add them to settings.py")
+    return row[0]
 
 
 def _not_yet_extracted(
@@ -158,10 +178,19 @@ def _not_yet_extracted(
     """Drops papers the run has done, or has out in a batch, with the same abstract.
 
     Only a changed abstract sends a paper back (docs/adr/0003): the hash is of the abstract
-    alone, so a new title does not.
+    alone, so a new title does not. A paper that is not in the database is an error here,
+    and not at the batch's INSERT, which comes after the client was called.
     """
     unique = {p.arxiv_id: p for p in reversed(papers)}  # the first of a repeated id wins
     ids = list(unique)
+    known = {
+        row[0]
+        for row in connection.execute(
+            "SELECT arxiv_id FROM paper WHERE arxiv_id = ANY(%s)", (ids,)
+        ).fetchall()
+    }
+    if missing := sorted(set(ids) - known):
+        raise ValueError(f"papers not in the database: {', '.join(missing)}")
     taken = connection.execute(
         """
         SELECT arxiv_id, abstract_hash FROM paper_extraction
@@ -169,7 +198,8 @@ def _not_yet_extracted(
         UNION
         SELECT bp.arxiv_id, bp.abstract_hash
           FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
-         WHERE b.run_id = %(run)s AND b.status = 'submitted' AND bp.arxiv_id = ANY(%(ids)s)
+         WHERE b.run_id = %(run)s AND b.status IN ('sending', 'submitted')
+           AND bp.arxiv_id = ANY(%(ids)s)
         """,
         {"run": run_id, "ids": ids},
     ).fetchall()
@@ -182,69 +212,80 @@ def _not_yet_extracted(
 
 
 def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) -> Counter:
-    """Stores a finished batch's answers. Counts "extracted", "mentions", "pending", "failed".
+    """Stores a finished batch's answers.
 
-    A batch not yet ended changes nothing. A batch already collected is left alone, so
-    running this again after a crash is safe. A paper whose answer is missing or not in the
-    schema gets no completion mark and counts as failed; the rest of the batch is kept.
+    Counts "extracted", "mentions", "pending" (not ended yet), "unsent" (stuck in
+    'sending', for a person to sort out), "failed" (no usable answer: the paper gets no
+    completion mark) and "stale" (the paper's abstract changed since the batch was sent, so
+    the answer is dropped and the paper stays due). A batch already collected is left
+    alone, so running this again after a crash is safe.
     """
-    try:
+    _require_idle(connection)
+    with connection.transaction():
         return _collect(connection, client, batch_id)
-    except BaseException:
-        connection.rollback()
-        raise
 
 
 def _collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) -> Counter:
     # The lock makes two collectors of one batch take turns instead of storing it twice.
     row = connection.execute(
-        "SELECT run_id, provider_batch_id, status FROM extraction_batch WHERE id = %s FOR UPDATE",
+        """
+        SELECT b.run_id, b.provider_batch_id, b.status, r.model
+          FROM extraction_batch b JOIN extraction_run r ON r.id = b.run_id
+         WHERE b.id = %s FOR UPDATE OF b
+        """,
         (batch_id,),
     ).fetchone()
     if row is None:
         raise LookupError(f"no extraction batch {batch_id}")
-    run_id, provider_batch_id, status = row
+    run_id, provider_batch_id, status, model = row
     if status == "collected":
-        connection.rollback()
         return Counter()
-    # The hash of the text that was sent, not the paper's current one: the abstract may
-    # have changed while the batch ran, and the mentions belong to the old text.
+    # The hash of the text that was sent: the abstract may have changed while the batch ran.
     sent = dict(
         connection.execute(
             "SELECT arxiv_id, abstract_hash FROM extraction_batch_paper WHERE batch_id = %s",
             (batch_id,),
         ).fetchall()
     )
+    if status == "sending":
+        return Counter(unsent=len(sent))
     if not client.batch_ended(provider_batch_id):
-        connection.rollback()
         return Counter(pending=len(sent))
 
+    current = dict(
+        connection.execute(
+            "SELECT arxiv_id, abstract_hash FROM paper WHERE arxiv_id = ANY(%s)", (list(sent),)
+        ).fetchall()
+    )
     counter: Counter = Counter()
     seen: set[str] = set()
-    unusable_input = unusable_output = 0
+    input_tokens = output_tokens = 0
     for result in client.batch_results(provider_batch_id):
+        # Every answer is billed, whatever becomes of it.
+        input_tokens += result.input_tokens
+        output_tokens += result.output_tokens
         if result.arxiv_id not in sent or result.arxiv_id in seen:
             continue
         seen.add(result.arxiv_id)
         if result.mentions is None:
-            unusable_input += result.input_tokens
-            unusable_output += result.output_tokens
             counter["failed"] += 1
-            continue
-        counter["extracted"] += 1
-        counter["mentions"] += _store(connection, run_id, sent[result.arxiv_id], result)
+        elif current.get(result.arxiv_id) != sent[result.arxiv_id]:
+            # The abstract changed after the send; a batch sent for the newer one may be
+            # stored already, and this answer must not replace it.
+            counter["stale"] += 1
+        else:
+            counter["extracted"] += 1
+            counter["mentions"] += _store(connection, run_id, sent[result.arxiv_id], result)
     if missing := len(sent) - len(seen):
         counter["failed"] += missing
     connection.execute(
         """
         UPDATE extraction_batch
-           SET status = 'collected', collected_at = now(),
-               unusable_input_tokens = %s, unusable_output_tokens = %s
+           SET status = 'collected', collected_at = now(), actual_cost_usd = %s
          WHERE id = %s
         """,
-        (unusable_input, unusable_output, batch_id),
+        (_usd(model, input_tokens, output_tokens), batch_id),
     )
-    connection.commit()
     return +counter  # drops zero counts
 
 
@@ -270,11 +311,16 @@ def _store(
         "DELETE FROM mention WHERE run_id = %s AND arxiv_id = %s", (run_id, result.arxiv_id)
     )
     # The key of a mention row is its type and spelling; a repeat adds nothing, except an
-    # expansion the first one lacked.
-    rows: dict[tuple[str, str], str | None] = {}
+    # expansion the first one lacked. A spelling of nothing but punctuation has an empty
+    # normal form, which would make every such spelling one entity, so it is not stored.
+    rows: dict[tuple[str, str], tuple[str, str | None]] = {}
     for mention in result.mentions.mentions:
+        form = normal_form(mention.spelling)
+        if not form:
+            continue
         key = (mention.entity_type, mention.spelling)
-        rows[key] = rows.get(key) or mention.expansion
+        earlier = rows[key][1] if key in rows else None
+        rows[key] = (form, earlier or mention.expansion)
     with connection.cursor() as cursor:
         cursor.executemany(
             """
@@ -282,8 +328,8 @@ def _store(
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             [
-                (run_id, result.arxiv_id, entity_type, spelling, normal_form(spelling), expansion)
-                for (entity_type, spelling), expansion in rows.items()
+                (run_id, result.arxiv_id, entity_type, spelling, form, expansion)
+                for (entity_type, spelling), (form, expansion) in rows.items()
             ],
         )
     return len(rows)
@@ -296,9 +342,7 @@ def request_params(request: ExtractionRequest) -> dict[str, Any]:
     return {
         "model": EXTRACTION_MODEL,
         "system": EXTRACTION_PROMPT,
-        "messages": [
-            {"role": "user", "content": f"Title: {request.title}\n\nAbstract: {request.abstract}"}
-        ],
+        "messages": [{"role": "user", "content": _request_text(request)}],
         # The model's answer is held to the schema; transform_schema is the SDK's way to
         # make a pydantic schema one the API accepts. Low effort: reading an abstract for
         # names needs little thinking, and thinking tokens are billed as output.
@@ -307,6 +351,10 @@ def request_params(request: ExtractionRequest) -> dict[str, Any]:
             "format": {"type": "json_schema", "schema": transform_schema(PaperMentions)},
         },
     }
+
+
+def _request_text(request: ExtractionRequest) -> str:
+    return f"Title: {request.title}\n\nAbstract: {request.abstract}"
 
 
 def result_from_batch_entry(entry: Any) -> ExtractionResult | None:
@@ -328,20 +376,50 @@ def result_from_batch_entry(entry: Any) -> ExtractionResult | None:
     )
 
 
+# About 100,000 tokens per counting call (a token is rarely under three characters of
+# English text), well inside what the endpoint takes.
+COUNT_CHARS_PER_CALL = 300_000
+
+
 class AnthropicModelClient:
     """ModelClient over the Message Batches API. Tests never build it (see conftest.py)."""
 
     def __init__(self) -> None:
         import anthropic
 
-        # Credentials come from the environment or the developer's login, never the repo.
+        # The key comes from an environment variable; in Cloud Run Secret Manager sets it.
         self._client = anthropic.Anthropic()
 
+    def _count(self, request: ExtractionRequest) -> int:
+        return self._client.messages.count_tokens(**request_params(request)).input_tokens
+
     def count_tokens(self, requests: Sequence[ExtractionRequest]) -> int:
-        # The endpoint counts one request at a time and does not bill.
-        return sum(
-            self._client.messages.count_tokens(**request_params(r)).input_tokens for r in requests
-        )
+        """Counts the batch in a few calls instead of one per paper.
+
+        What every request shares (system prompt, schema, framing) is counted once, on a
+        request with no text, and multiplied by the number of requests. The papers' own
+        text is counted glued together in parts. Each part carries the shared part once
+        more, so the sum is an overestimate, which is the safe side for a ceiling. The
+        endpoint counts and does not bill.
+        """
+        overhead = self._count(ExtractionRequest("", "", ""))
+        total = len(requests) * overhead
+        part: list[str] = []
+        size = 0
+        for request in requests:
+            text = _request_text(request)
+            if part and size + len(text) > COUNT_CHARS_PER_CALL:
+                total += self._count_part(part)
+                part, size = [], 0
+            part.append(text)
+            size += len(text)
+        if part:
+            total += self._count_part(part)
+        return total
+
+    def _count_part(self, texts: list[str]) -> int:
+        # A part is one request whose message is the papers' texts one after another.
+        return self._count(ExtractionRequest("", "", "\n\n".join(texts)))
 
     def submit_batch(self, requests: Sequence[ExtractionRequest]) -> str:
         entries = [

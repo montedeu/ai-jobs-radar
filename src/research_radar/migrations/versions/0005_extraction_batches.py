@@ -20,20 +20,22 @@ def upgrade() -> None:
 
         -- One row per batch sent to the model. Submitting and collecting are separate
         -- steps that can be hours apart, so the state lives here, not in the process.
+        -- The row is written as 'sending' before the batch leaves, so a batch that was
+        -- paid for is never missing here; a failure in between leaves it 'sending', for
+        -- a person to sort out. This table is also the ledger of spent money: it outlives
+        -- the papers, and a run that has batches cannot be deleted.
         CREATE TABLE extraction_batch (
-            id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            run_id            bigint      NOT NULL REFERENCES extraction_run ON DELETE CASCADE,
-            provider_batch_id text        NOT NULL UNIQUE,
-            status            text        NOT NULL DEFAULT 'submitted'
-                              CHECK (status IN ('submitted', 'collected')),
+            id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            run_id             bigint      NOT NULL REFERENCES extraction_run ON DELETE RESTRICT,
+            provider_batch_id  text        UNIQUE,   -- NULL while 'sending'
+            status             text        NOT NULL DEFAULT 'sending'
+                               CHECK (status IN ('sending', 'submitted', 'collected')),
             -- the most the batch could cost: counted input plus the output cap
-            estimated_cost_usd numeric    NOT NULL,
-            -- billed for answers that gave no paper_extraction row (not matching the
-            -- schema): the money is spent although the paper is not done
-            unusable_input_tokens  integer NOT NULL DEFAULT 0,
-            unusable_output_tokens integer NOT NULL DEFAULT 0,
-            submitted_at      timestamptz NOT NULL DEFAULT now(),
-            collected_at      timestamptz
+            estimated_cost_usd numeric     NOT NULL,
+            -- what every answer of the batch cost, unusable and outdated ones included
+            actual_cost_usd    numeric,
+            submitted_at       timestamptz NOT NULL DEFAULT now(),
+            collected_at       timestamptz
         );
 
         -- The papers a batch carries and the hash of the text that was sent: the

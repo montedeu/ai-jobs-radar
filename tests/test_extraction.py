@@ -19,8 +19,7 @@ from research_radar.extraction import (
 from research_radar.mentions import Mention, PaperMentions
 from research_radar.papers import abstract_hash
 from research_radar.settings import (
-    BATCH_INPUT_USD_PER_MTOK,
-    BATCH_OUTPUT_USD_PER_MTOK,
+    BATCH_PRICES_USD_PER_MTOK,
     EXTRACTION_MAX_OUTPUT_TOKENS,
     EXTRACTION_MODEL,
 )
@@ -50,17 +49,17 @@ SURVEY_ANSWER = ExtractionResult("2511.00002", PaperMentions(mentions=[]), 90, 5
 
 
 def usd(input_tokens, output_tokens):
-    return (
-        Decimal(input_tokens) * BATCH_INPUT_USD_PER_MTOK
-        + Decimal(output_tokens) * BATCH_OUTPUT_USD_PER_MTOK
-    ) / 1_000_000
+    price_in, price_out = BATCH_PRICES_USD_PER_MTOK[EXTRACTION_MODEL]
+    return (Decimal(input_tokens) * price_in + Decimal(output_tokens) * price_out) / 1_000_000
 
 
 class FakeModel:
     """Stands in for the model client: serves the answers it was given, and logs calls."""
 
-    def __init__(self, *answers, ended=True, counted_tokens=1000):
+    def __init__(self, *answers, ended=True, counted_tokens=1000, fail_submit=False):
         self.answers = {a.arxiv_id: a for a in answers}
+        self.batch_answers = {}  # batch id -> {arxiv_id: answer}, when batches differ
+        self.fail_submit = fail_submit
         self.ended = ended
         self.counted_tokens = counted_tokens
         self.calls = []
@@ -72,6 +71,8 @@ class FakeModel:
 
     def submit_batch(self, requests):
         self.calls.append("submit_batch")
+        if self.fail_submit:
+            raise RuntimeError("connection lost")
         batch_id = f"batch-{len(self.batches) + 1}"
         self.batches[batch_id] = [r.arxiv_id for r in requests]
         return batch_id
@@ -82,12 +83,15 @@ class FakeModel:
 
     def batch_results(self, batch_id):
         self.calls.append("batch_results")
-        return iter(self.answers[i] for i in self.batches[batch_id] if i in self.answers)
+        answers = self.batch_answers.get(batch_id, self.answers)
+        return iter(answers[i] for i in self.batches[batch_id] if i in answers)
 
 
 @pytest.fixture
 def connection(database_url):
-    with psycopg.connect(database_url) as connection:
+    # Autocommit: submit and collect need a connection with no transaction open, and a
+    # test's own read must not leave one behind.
+    with psycopg.connect(database_url, autocommit=True) as connection:
         yield connection
 
 
@@ -105,7 +109,7 @@ def add_papers(connection, *requests):
 
 
 def new_run(connection):
-    return start_run(connection, model="fake-model", prompt_hash="stub")
+    return start_run(connection, model=EXTRACTION_MODEL, prompt_hash="stub")
 
 
 def run_batch(connection, model, run_id, *requests):
@@ -251,20 +255,18 @@ def test_batch_over_ceiling_is_not_submitted(connection):
 
 
 def test_batch_is_counted_against_already_spent_money(connection):
-    add_papers(connection, LORA, SURVEY)
+    add_papers(connection, LORA)
     connection.execute(
-        "INSERT INTO paper_extraction (run_id, arxiv_id, abstract_hash, input_tokens,"
-        " output_tokens) VALUES (%s, %s, 'h', 19_999_000, 0)",  # $0.99995 of the $1 ceiling
-        (new_run(connection), SURVEY.arxiv_id),
+        "INSERT INTO extraction_batch (run_id, provider_batch_id, status, estimated_cost_usd,"
+        " actual_cost_usd) VALUES (%s, 'earlier', 'collected', 2, %s)",
+        (new_run(connection), Decimal("0.99995")),  # of the $1 ceiling
     )
-    connection.commit()
-    ceiling = Decimal(1)
     model = FakeModel(counted_tokens=1000)
     run_id = new_run(connection)
     # On its own the batch is far below the ceiling.
     assert usd(1000, EXTRACTION_MAX_OUTPUT_TOKENS) < Decimal("0.001")
     with pytest.raises(BudgetExceeded):
-        submit(connection, model, run_id, [LORA], ceiling_usd=ceiling)
+        submit(connection, model, run_id, [LORA], ceiling_usd=Decimal(1))
     assert "submit_batch" not in model.calls
     assert submit(connection, model, run_id, [LORA], ceiling_usd=Decimal(2)) is not None
 
@@ -413,3 +415,214 @@ def test_batch_entry_not_in_the_schema_keeps_its_tokens_but_no_mentions():
 @pytest.mark.parametrize("result_type", ["errored", "canceled", "expired"])
 def test_batch_entry_that_was_not_answered_is_skipped(result_type):
     assert extraction.result_from_batch_entry(batch_entry(result_type)) is None
+
+
+def advisory_locks(connection):
+    query = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
+    return connection.execute(query).fetchone()[0]
+
+
+def test_batch_row_is_written_before_the_batch_is_sent(connection):
+    add_papers(connection, LORA, SURVEY)
+    model = FakeModel(fail_submit=True)
+    with pytest.raises(RuntimeError):
+        submit(connection, model, new_run(connection), [LORA, SURVEY])
+    status, provider_id, estimate = connection.execute(
+        "SELECT status, provider_batch_id, estimated_cost_usd FROM extraction_batch"
+    ).fetchone()
+    assert (status, provider_id) == ("sending", None)
+    assert connection.execute("SELECT count(*) FROM extraction_batch_paper").fetchone() == (2,)
+    assert spent_usd(connection) == estimate
+    # Nobody can tell whether the batch left, so collect leaves it for a person.
+    batch_id = connection.execute("SELECT id FROM extraction_batch").fetchone()[0]
+    healthy = FakeModel(LORA_ANSWER)
+    assert collect(connection, healthy, batch_id) == Counter(unsent=2)
+    assert healthy.calls == []
+
+
+def test_sending_batch_blocks_the_same_papers(connection):
+    add_papers(connection, LORA)
+    run_id = new_run(connection)
+    with pytest.raises(RuntimeError):
+        submit(connection, FakeModel(fail_submit=True), run_id, [LORA])
+    healthy = FakeModel()
+    assert submit(connection, healthy, run_id, [LORA]) is None
+    assert healthy.calls == []
+
+
+def test_paper_missing_from_the_database_fails_before_the_client_is_called(connection):
+    model = FakeModel()
+    with pytest.raises(ValueError, match="2511.00001"):
+        submit(connection, model, new_run(connection), [LORA])
+    assert model.calls == []
+    assert connection.execute("SELECT count(*) FROM extraction_batch").fetchone() == (0,)
+
+
+def test_unknown_model_fails_before_the_client_is_called(connection):
+    add_papers(connection, LORA)
+    run_id = start_run(connection, model="no-such-model", prompt_hash="stub")
+    model = FakeModel()
+    with pytest.raises(ValueError, match="no-such-model"):
+        submit(connection, model, run_id, [LORA])
+    assert model.calls == []
+
+
+class Explodes(FakeModel):
+    def count_tokens(self, requests):
+        raise RuntimeError("network down")
+
+
+@pytest.mark.parametrize(
+    "model, error",
+    [
+        (FakeModel(counted_tokens=30_000_000), BudgetExceeded),
+        (FakeModel(fail_submit=True), RuntimeError),
+        (Explodes(), RuntimeError),
+    ],
+)
+def test_failed_submit_leaves_no_open_transaction_and_no_lock(connection, model, error):
+    add_papers(connection, LORA)
+    run_id = new_run(connection)
+    with pytest.raises(error):
+        submit(connection, model, run_id, [LORA], ceiling_usd=Decimal(1))
+    assert connection.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+    assert advisory_locks(connection) == 0
+
+
+def test_submit_and_collect_refuse_a_connection_with_an_open_transaction(connection):
+    add_papers(connection, LORA)
+    run_id = new_run(connection)
+    batch_id = submit(connection, FakeModel(), run_id, [LORA])
+    model = FakeModel(LORA_ANSWER)
+    with connection.transaction():
+        connection.execute("UPDATE extraction_run SET note = 'callers work'")
+        with pytest.raises(ValueError, match="transaction"):
+            submit(connection, model, run_id, [SURVEY])
+        with pytest.raises(ValueError, match="transaction"):
+            collect(connection, model, batch_id)
+    assert model.calls == []
+    # Neither call rolled the caller's work back.
+    assert connection.execute("SELECT note FROM extraction_run").fetchone() == ("callers work",)
+
+
+def test_collected_result_of_an_outdated_abstract_does_not_overwrite_a_newer_one(connection):
+    add_papers(connection, LORA)
+    run_id = new_run(connection)
+    model = FakeModel()
+    old_batch = submit(connection, model, run_id, [LORA])
+    edited = ExtractionRequest(LORA.arxiv_id, LORA.title, "We study LoRA for summarization.")
+    connection.execute(
+        "UPDATE paper SET abstract = %s, abstract_hash = %s",
+        (edited.abstract, abstract_hash(edited.abstract)),
+    )
+    new_batch = submit(connection, model, run_id, [edited])
+    newer = ExtractionResult(
+        LORA.arxiv_id,
+        PaperMentions(mentions=[Mention(entity_type="task", spelling="summarization")]),
+        50,
+        10,
+    )
+    model.batch_answers = {
+        "batch-1": {LORA.arxiv_id: LORA_ANSWER},
+        "batch-2": {LORA.arxiv_id: newer},
+    }
+    assert collect(connection, model, new_batch) == Counter(extracted=1, mentions=1)
+    assert collect(connection, model, old_batch) == Counter(stale=1)
+    assert mention_rows(connection) == [
+        ("2511.00001", "task", "summarization", "summarization", None)
+    ]
+    assert connection.execute(
+        "SELECT abstract_hash, input_tokens FROM paper_extraction"
+    ).fetchall() == [(abstract_hash(edited.abstract), 50)]
+    # The outdated answer was billed all the same.
+    assert spent_usd(connection) == usd(170, 50)
+
+
+def test_collected_batch_records_what_it_cost_including_unusable_answers(connection):
+    add_papers(connection, LORA, SURVEY)
+    model = FakeModel(ExtractionResult(LORA.arxiv_id, None, 120, 40), SURVEY_ANSWER)
+    batch_id, _ = run_batch(connection, model, new_run(connection), LORA, SURVEY)
+    assert connection.execute(
+        "SELECT actual_cost_usd FROM extraction_batch WHERE id = %s", (batch_id,)
+    ).fetchone() == (usd(210, 45),)
+
+
+def test_spent_money_survives_deleting_papers_and_a_run_with_batches_cannot_be_deleted(
+    connection,
+):
+    add_papers(connection, LORA)
+    run_id = new_run(connection)
+    run_batch(connection, FakeModel(LORA_ANSWER), run_id, LORA)
+    spent = spent_usd(connection)
+    connection.execute("DELETE FROM paper")
+    assert spent_usd(connection) == spent > 0
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        connection.execute("DELETE FROM extraction_run WHERE id = %s", (run_id,))
+
+
+def test_blank_spelling_is_rejected():
+    for spelling in ("", "   "):
+        with pytest.raises(ValidationError):
+            Mention(entity_type="task", spelling=spelling)
+
+
+def test_mention_with_an_empty_normal_form_is_not_stored(connection):
+    add_papers(connection, LORA)
+    answer = ExtractionResult(
+        LORA.arxiv_id,
+        PaperMentions(
+            mentions=[
+                Mention(entity_type="task", spelling="-"),
+                Mention(entity_type="method", spelling="LoRA"),
+            ]
+        ),
+        10,
+        5,
+    )
+    _, counter = run_batch(connection, FakeModel(answer), new_run(connection), LORA)
+    assert counter == Counter(extracted=1, mentions=1)
+    assert [row[2] for row in mention_rows(connection)] == ["LoRA"]
+
+
+class FakeSdk:
+    """The SDK client as far as counting goes: 100 tokens of overhead and a token a char."""
+
+    def __init__(self):
+        self.messages = self
+        self.counted = []
+
+    def count_tokens(self, **params):
+        text = params["messages"][0]["content"]
+        self.counted.append(text)
+        return SimpleNamespace(input_tokens=100 + len(text))
+
+
+def test_real_client_counts_overhead_once_per_request_and_abstracts_in_glued_parts(monkeypatch):
+    monkeypatch.setattr(extraction, "COUNT_CHARS_PER_CALL", 200)
+    sdk = FakeSdk()
+    client = extraction.AnthropicModelClient.__new__(extraction.AnthropicModelClient)
+    client._client = sdk
+    requests = [ExtractionRequest(f"id{i}", f"t{i}", "x" * 60) for i in range(7)]
+    total = client.count_tokens(requests)
+    overhead_text, *parts = sdk.counted
+    assert "x" not in overhead_text
+    # Far fewer calls than requests, and every paper is in exactly one part.
+    assert 1 < len(parts) < len(requests)
+    assert all(sum(part.count(f"Title: t{i}") for part in parts) == 1 for i in range(7))
+    overhead = 100 + len(overhead_text)
+    assert total == sum(100 + len(part) for part in parts) + len(requests) * overhead
+
+
+def test_counting_happens_before_the_budget_lock_is_taken(connection):
+    add_papers(connection, LORA)
+
+    class Probing(FakeModel):
+        locks_while_counting = None
+
+        def count_tokens(self, requests):
+            self.locks_while_counting = advisory_locks(connection)
+            return super().count_tokens(requests)
+
+    model = Probing()
+    submit(connection, model, new_run(connection), [LORA])
+    assert model.locks_while_counting == 0
