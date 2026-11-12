@@ -89,6 +89,10 @@ class ModelClient(Protocol):
 MAX_COUNTS = 2
 
 
+class AbstractsKeepChanging(Exception):
+    """Papers changed under every count of a submit; try again."""
+
+
 class BudgetExceeded(Exception):
     """The batch, with what is already spent, would pass the ceiling."""
 
@@ -166,14 +170,15 @@ def submit(
         with connection.transaction():
             # Two submits at once would each see the same spent money and both pass the ceiling.
             connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
-            counted = {request.arxiv_id: abstract for request, abstract in todo}
+            counted = {request.arxiv_id: request for request, _ in todo}
             # Another submit may have taken some of the papers while this one was counting;
             # then the estimate covers more than is sent, the safe side.
             todo = _due(connection, run_id, list(counted))
             if not todo:
                 return None
-            if any(counted[request.arxiv_id] != abstract for request, abstract in todo):
-                # An abstract changed since the count, so the estimate is of another text.
+            if any(counted[request.arxiv_id] != request for request, _ in todo):
+                # The title or abstract changed since the count, so the estimate is of
+                # another text.
                 # Leaving the block frees the lock before the slow count is done again.
                 continue
             if spent_usd(connection) + estimate > ceiling_usd:
@@ -193,7 +198,7 @@ def submit(
                 )
             break
     else:
-        raise RuntimeError(f"abstracts changed during each of {MAX_COUNTS} counts; try again")
+        raise AbstractsKeepChanging(f"papers changed during each of {MAX_COUNTS} counts")
     try:
         provider_batch_id = client.submit_batch([request for request, _ in todo], model=model)
     except BatchRejected:
@@ -214,10 +219,11 @@ def submit(
 def _supported(arxiv_ids: Sequence[str]) -> list[str]:
     """The ids of a shape that can be sent; the others are left out and logged."""
     unique = list(dict.fromkeys(arxiv_ids))
-    unsupported = [i for i in unique if not _ARXIV_ID.fullmatch(i)]
-    if unsupported:
+    supported = {i for i in unique if _ARXIV_ID.fullmatch(i)}
+    if len(supported) < len(unique):
+        unsupported = [i for i in unique if i not in supported]
         log.warning("not sent, arXiv id of an unsupported shape: %s", ", ".join(unsupported))
-    return [i for i in unique if i not in unsupported]
+    return [i for i in unique if i in supported]
 
 
 def _run_model(connection: psycopg.Connection, run_id: int) -> str:
@@ -270,11 +276,13 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
     """Stores a finished batch's answers.
 
     Counts "extracted", "mentions", "pending" (not ended yet), "unsent" (stuck in
-    'sending', for a person to sort out), "rejected", "failed" (no usable answer: the paper
-    gets no completion mark), "incomplete" (the batch ended with fewer results than papers;
-    nothing is stored and the batch stays 'submitted', so the next call tries again) and
-    "stale" (the paper's abstract changed since the batch was sent, so the answer is dropped
-    and the paper stays due). A batch already collected is left alone, so running this
+    'sending', for a person to sort out), "rejected" (the API refused the batch), "failed"
+    (the paper's request got no usable answer, or none at all because it errored, expired
+    or was canceled: no completion mark, so the paper is due again), "stale" (the paper's
+    abstract changed since the batch was sent, so the answer is dropped and the paper stays
+    due) and "incomplete" (the stream has no result at all for some of the batch's papers,
+    which is a download that broke off: nothing is stored, the batch stays 'submitted' and
+    the next call tries again). A batch already collected is left alone, so running this
     again after a crash is safe.
 
     The network is read first, with no transaction and no lock; the database is written in
@@ -324,6 +332,13 @@ def _store_batch(
             (batch_id,),
         ).fetchall()
     )
+    answered = {result.arxiv_id for result in results} & set(sent)
+    if len(answered) < len(sent):
+        # The Batches API gives a line for every request, so a short stream is a download
+        # that broke off. Storing part of it would mark the batch done and lose the rest.
+        return Counter(incomplete=len(sent) - len(answered))
+    # Shared locks keep an abstract from changing between this check and the commit. They
+    # come after the check above, so a batch that is not stored holds nothing of the papers.
     # Shared locks keep an abstract from changing between this check and the commit.
     current = dict(
         connection.execute(
@@ -331,11 +346,6 @@ def _store_batch(
             (list(sent),),
         ).fetchall()
     )
-    answered = {result.arxiv_id for result in results} & set(sent)
-    if len(answered) < len(sent):
-        # The Batches API gives a line for every request, so a short stream is a download
-        # that broke off. Storing part of it would mark the batch done and lose the rest.
-        return Counter(incomplete=len(sent) - len(answered))
     counter: Counter = Counter()
     seen: set[str] = set()
     input_tokens = output_tokens = 0
@@ -443,14 +453,15 @@ def _custom_id(arxiv_id: str) -> str:
     return arxiv_id.replace(".", "_")
 
 
-def result_from_batch_entry(entry: Any) -> ExtractionResult | None:
-    """One line of a batch's results. None for a request that was not answered.
+def result_from_batch_entry(entry: Any) -> ExtractionResult:
+    """One line of a batch's results, as a result.
 
-    An errored, canceled or expired request was not billed and has no tokens to record.
-    Its paper gets no completion mark and is counted failed by collect.
+    An errored, canceled or expired request was not billed: it becomes a result with no
+    mentions and no tokens, so that it is in the stream and collect counts it failed. Left
+    out, it would make the whole batch look cut off.
     """
     if entry.result.type != "succeeded":
-        return None
+        return ExtractionResult(entry.custom_id.replace("_", "."), None, 0, 0)
     message = entry.result.message
     text = next((block.text for block in message.content if block.type == "text"), None)
     try:
@@ -542,5 +553,4 @@ class AnthropicModelClient:
 
     def batch_results(self, batch_id: str) -> Iterator[ExtractionResult]:
         for entry in self._client.messages.batches.results(batch_id):
-            if (result := result_from_batch_entry(entry)) is not None:
-                yield result
+            yield result_from_batch_entry(entry)

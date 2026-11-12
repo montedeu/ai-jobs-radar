@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from research_radar import extraction
 from research_radar.extraction import (
+    AbstractsKeepChanging,
     BatchRejected,
     BudgetExceeded,
     ExtractionRequest,
@@ -430,8 +431,11 @@ def test_batch_entry_not_in_the_schema_keeps_its_tokens_but_no_mentions():
 
 
 @pytest.mark.parametrize("result_type", ["errored", "canceled", "expired"])
-def test_batch_entry_that_was_not_answered_is_skipped(result_type):
-    assert extraction.result_from_batch_entry(batch_entry(result_type)) is None
+def test_batch_entry_that_was_not_answered_is_a_result_without_mentions_and_tokens(result_type):
+    # It must be in the stream, or the batch would look cut off (see "incomplete").
+    entry = batch_entry(result_type)
+    entry.custom_id = "2511_00001"
+    assert extraction.result_from_batch_entry(entry) == ExtractionResult("2511.00001", None, 0, 0)
 
 
 def advisory_locks(connection):
@@ -766,6 +770,14 @@ class FakeBatches:
         self.created.append(requests)
         return SimpleNamespace(id="msgbatch_1")
 
+    entries = ()
+
+    def retrieve(self, batch_id):
+        return SimpleNamespace(processing_status="ended")
+
+    def results(self, batch_id):
+        return iter(self.entries)
+
 
 class FakeSdkWithBatches:
     def __init__(self, error=None):
@@ -892,7 +904,7 @@ def test_the_batch_carries_the_text_that_was_counted_last(connection):
 def test_abstracts_that_keep_changing_stop_after_two_counts(connection):
     add_papers(connection, LORA)
     model = EditsWhileCounting(connection, [1000, 1000, 1000], edits=5)
-    with pytest.raises(RuntimeError, match="changed"):
+    with pytest.raises(AbstractsKeepChanging):
         submit(connection, model, new_run(connection), [LORA.arxiv_id])
     assert len(model.counted_texts) == 2
     assert "submit_batch" not in model.calls
@@ -925,8 +937,8 @@ def test_only_unsupported_ids_send_nothing(connection):
 @pytest.mark.parametrize(
     "client_class, arguments",
     [
-        ("Anthropic", {}),
-        ("AsyncAnthropic", {}),
+        ("Anthropic", {"api_key": "k"}),
+        ("AsyncAnthropic", {"api_key": "k"}),
         ("AnthropicBedrock", {"aws_region": "us-east-1"}),
         ("AnthropicBedrockMantle", {"aws_region": "us-east-1"}),
         ("AnthropicVertex", {"region": "us-east5", "project_id": "p"}),
@@ -937,3 +949,40 @@ def test_no_sdk_client_of_any_kind_can_be_built_in_a_test(client_class, argument
     anthropic = pytest.importorskip("anthropic")
     with pytest.raises(AssertionError, match="Anthropic API"):
         getattr(anthropic, client_class)(**arguments)
+
+
+def test_batch_with_an_expired_request_is_collected_and_the_paper_stays_due(connection):
+    add_papers(connection, LORA, SURVEY)
+    run_id = new_run(connection)
+    batch_id = submit(connection, FakeModel(), run_id, [LORA.arxiv_id, SURVEY.arxiv_id])
+    answered = batch_entry("succeeded", LORA_ANSWER.mentions.model_dump_json(), usage=(120, 40))
+    expired = batch_entry("expired")
+    expired.custom_id = "2511_00002"
+    answered.custom_id = "2511_00001"
+    sdk = FakeSdkWithBatches()
+    sdk.batches.entries = [answered, expired]
+    counter = collect(connection, real_client(sdk), batch_id)
+    assert counter == Counter(extracted=1, mentions=4, failed=1)
+    assert connection.execute("SELECT status FROM extraction_batch").fetchone() == ("collected",)
+    assert connection.execute("SELECT arxiv_id FROM paper_extraction").fetchall() == [
+        (LORA.arxiv_id,)
+    ]
+    # No mark for the expired one: it is due again.
+    again = FakeModel()
+    again.batches = {"batch-1": []}  # provider ids are unique
+    assert submit(connection, again, run_id, [SURVEY.arxiv_id]) is not None
+
+
+def test_title_changed_while_counting_is_counted_again_too(connection):
+    add_papers(connection, LORA)
+
+    class EditsTitle(FakeModel):
+        def count_tokens(self, requests, *, model):
+            if not self.calls:
+                connection.execute("UPDATE paper SET title = 'A longer, new title'")
+            return super().count_tokens(requests, model=model)
+
+    model = EditsTitle()
+    submit(connection, model, new_run(connection), [LORA.arxiv_id])
+    assert model.calls == ["count_tokens", "count_tokens", "submit_batch"]
+    assert model.sent[0][0].title == "A longer, new title"
