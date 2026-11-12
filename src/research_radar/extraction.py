@@ -5,18 +5,19 @@ the process that sent it may be gone by then. Everything the second step needs i
 database. The model is reached only through ModelClient; tests pass a fake one.
 """
 
+import functools
 import json
 import logging
 import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import Any, Protocol
 
 import psycopg
 from psycopg.types.json import Jsonb
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from research_radar.mentions import PaperMentions
 from research_radar.normalize import normal_form
@@ -28,6 +29,7 @@ from research_radar.settings import (
     EXTRACTION_MAX_ATTEMPTS,
     EXTRACTION_MAX_OUTPUT_TOKENS,
     HISTORY_START,
+    REASONING_BY_DEFAULT_MODELS,
 )
 
 log = logging.getLogger(__name__)
@@ -67,6 +69,16 @@ class RunConfigMismatch(Exception):
     """The code would send requests that differ from the ones the run was started with."""
 
 
+class _StoredConfig(BaseModel):
+    """extraction_run.request_config as read back: every field present, of exactly its type."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    reasoning: bool
+    max_output_tokens: int = Field(gt=0)
+
+
+@functools.cache
 def _output_schema() -> dict[str, Any]:
     # The model's answer is held to the schema; transform_schema is the SDK's way to make
     # a pydantic schema one the API accepts.
@@ -79,18 +91,19 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def config_hash(config: RequestConfig) -> str:
-    """The hash of everything that shapes the model's answer except the paper's text."""
-    return text_hash(
-        _canonical_json(
-            {
-                "system": EXTRACTION_PROMPT,
-                "message_template": MESSAGE_TEMPLATE,
-                "output_schema": _output_schema(),
-                "config": asdict(config),
-            }
-        )
-    )
+def config_hash(config: RequestConfig, model: str) -> str:
+    """The hash of the request a run sends, apart from the paper's text and the model.
+
+    It is the hash of the very parameters that go into a batch entry, built by
+    request_params from a stand-in paper whose title and abstract are the placeholders, so
+    nothing that is sent can change without the hash changing. The model is left out: the
+    run records it itself.
+    """
+    stand_in = ExtractionRequest("", "{title}", "{abstract}")
+    params = request_params(stand_in, model, config)
+    del params["model"]
+    params["max_tokens"] = config.max_output_tokens
+    return text_hash(_canonical_json(params))
 
 
 @dataclass(frozen=True)
@@ -169,11 +182,18 @@ def start_run(
     the current run.
     """
     require_idle(connection)
+    if config.reasoning and model not in REASONING_BY_DEFAULT_MODELS:
+        # With reasoning on, the request sends no thinking parameter and relies on the
+        # model's default; that is known only for the models in the set.
+        raise ValueError(
+            f"model {model!r} is not known to reason by default; add it to "
+            "REASONING_BY_DEFAULT_MODELS in settings.py, or start the run without reasoning"
+        )
     with connection.transaction():
         run_id = connection.execute(
             "INSERT INTO extraction_run (model, prompt_hash, request_config, note, is_full)"
             " VALUES (%s, %s, %s, %s, %s) RETURNING id",
-            (model, config_hash(config), Jsonb(asdict(config)), note, full),
+            (model, config_hash(config, model), Jsonb(asdict(config)), note, full),
         ).fetchone()[0]
         if full:
             connection.execute(
@@ -345,10 +365,15 @@ def _run_settings(connection: psycopg.Connection, run_id: int) -> tuple[str, Req
     model, pinned_hash, stored = row
     if model not in BATCH_PRICES_USD_PER_MTOK:
         raise ValueError(f"no batch prices for model {model!r}; add them to settings.py")
-    # A run from before the config was stored has an empty object: the default one.
-    known = {field.name for field in fields(RequestConfig)}
-    config = RequestConfig(**{key: value for key, value in stored.items() if key in known})
-    if config_hash(config) != pinned_hash:
+    try:
+        config = RequestConfig(**_StoredConfig.model_validate(stored).model_dump())
+    except ValidationError as error:
+        # An empty object is what a run from before migration 0007 has; there is no such
+        # run to be kept alive, so it is an error like any other bad value.
+        raise RunConfigMismatch(
+            f"run {run_id} has no valid request configuration ({stored!r}); start a new run"
+        ) from error
+    if config_hash(config, model) != pinned_hash:
         raise RunConfigMismatch(
             f"run {run_id} was started with another prompt, template, schema or request "
             "configuration than the code has now; start a new run"

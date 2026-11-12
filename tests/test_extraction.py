@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import psycopg
 import pytest
+from fakes import FakeModel, FakeSdkWithBatches, real_client
 from pydantic import ValidationError
 
 from research_radar import extraction
@@ -15,6 +16,7 @@ from research_radar.extraction import (
     BudgetExceeded,
     ExtractionRequest,
     ExtractionResult,
+    RequestConfig,
     collect,
     spent_usd,
     start_run,
@@ -34,6 +36,7 @@ LORA = ExtractionRequest(
     "We fine-tune Llama 3.1 8B with Low-Rank Adaptation (LoRA) for machine translation, "
     "and evaluate on FLORES-200.",
 )
+NO_THINKING = RequestConfig(reasoning=False)
 SURVEY = ExtractionRequest("2511.00002", "A survey", "We survey open problems in the field.")
 
 LORA_ANSWER = ExtractionResult(
@@ -54,50 +57,6 @@ SURVEY_ANSWER = ExtractionResult("2511.00002", PaperMentions(mentions=[]), 90, 5
 
 def usd(input_tokens, output_tokens):
     return extraction._usd(EXTRACTION_MODEL, input_tokens, output_tokens)
-
-
-class FakeModel:
-    """Stands in for the model client: serves the answers it was given, and logs calls."""
-
-    def __init__(
-        self, *answers, ended=True, counted_tokens=1000, fail_submit=False, reject_submit=False
-    ):
-        self.answers = {a.arxiv_id: a for a in answers}
-        self.batch_answers = {}  # batch id -> {arxiv_id: answer}, when batches differ
-        self.fail_submit = fail_submit
-        self.reject_submit = reject_submit
-        self.models = []  # the model each call was given
-        self.sent = []  # the requests of each submitted batch
-        self.ended = ended
-        self.counted_tokens = counted_tokens
-        self.calls = []
-        self.batches = {}
-
-    def count_tokens(self, requests, *, model, config):
-        self.calls.append("count_tokens")
-        self.models.append(model)
-        return self.counted_tokens
-
-    def submit_batch(self, requests, *, model, config):
-        self.calls.append("submit_batch")
-        self.models.append(model)
-        if self.fail_submit:
-            raise RuntimeError("connection lost")
-        if self.reject_submit:
-            raise BatchRejected("invalid request")
-        self.sent.append(list(requests))
-        batch_id = f"batch-{len(self.batches) + 1}"
-        self.batches[batch_id] = [r.arxiv_id for r in requests]
-        return batch_id
-
-    def batch_ended(self, batch_id):
-        self.calls.append("batch_ended")
-        return self.ended
-
-    def batch_results(self, batch_id):
-        self.calls.append("batch_results")
-        answers = self.batch_answers.get(batch_id, self.answers)
-        return iter(answers[i] for i in self.batches[batch_id] if i in answers)
 
 
 @pytest.fixture
@@ -485,7 +444,7 @@ def test_paper_missing_from_the_database_fails_before_the_client_is_called(conne
 
 def test_unknown_model_fails_before_the_client_is_called(connection):
     add_papers(connection, LORA)
-    run_id = start_run(connection, model="no-such-model")
+    run_id = start_run(connection, model="no-such-model", config=NO_THINKING)
     model = FakeModel()
     with pytest.raises(ValueError, match="no-such-model"):
         submit(connection, model, run_id, [LORA.arxiv_id])
@@ -671,7 +630,7 @@ def test_run_model_is_what_the_client_is_called_with_and_priced_by(connection, m
         extraction.BATCH_PRICES_USD_PER_MTOK, "other-model", (Decimal(1), Decimal(2))
     )
     add_papers(connection, LORA)
-    run_id = start_run(connection, model="other-model")
+    run_id = start_run(connection, model="other-model", config=NO_THINKING)
     model = FakeModel(counted_tokens=1_000_000)
     batch_id = submit(connection, model, run_id, [LORA.arxiv_id])
     assert model.models == ["other-model", "other-model"]
@@ -761,43 +720,6 @@ def test_collect_holds_a_share_lock_on_the_papers_it_stores_against(connection, 
     finally:
         extraction._store = real_store
     assert outcome == ["blocked"]
-
-
-class FakeBatches:
-    def __init__(self, error=None):
-        self.error = error
-        self.created = []
-
-    def create(self, *, requests):
-        if self.error:
-            raise self.error
-        self.created.append(requests)
-        return SimpleNamespace(id="msgbatch_1")
-
-    entries = ()
-
-    def retrieve(self, batch_id):
-        return SimpleNamespace(processing_status="ended")
-
-    def results(self, batch_id):
-        return iter(self.entries)
-
-
-class FakeSdkWithBatches:
-    def __init__(self, error=None):
-        self.options = []
-        self.batches = FakeBatches(error)
-        self.messages = SimpleNamespace(batches=self.batches)
-
-    def with_options(self, **options):
-        self.options.append(options)
-        return self
-
-
-def real_client(sdk):
-    client = extraction.AnthropicModelClient.__new__(extraction.AnthropicModelClient)
-    client._client = sdk
-    return client
 
 
 def test_real_client_creates_the_batch_once_with_encoded_ids_and_the_runs_model():

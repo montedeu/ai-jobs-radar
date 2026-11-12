@@ -16,9 +16,10 @@ def upgrade() -> None:
     op.execute(
         """
         -- The settings of the request that are not in the prompt text: reasoning on or off
-        -- and the output cap. Their hash, with the prompt, template and schema, is
-        -- prompt_hash. An empty object (every run that exists before this migration) reads
-        -- as the default configuration.
+        -- and the output cap, as {"reasoning": bool, "max_output_tokens": int}. Their hash
+        -- with the rest of the request is prompt_hash. The default exists only to let the
+        -- column be added; an empty object is not a valid configuration, and submit refuses
+        -- a run that has one.
         ALTER TABLE extraction_run
             ADD COLUMN request_config jsonb NOT NULL DEFAULT '{}';
         """
