@@ -2,6 +2,8 @@
 
 import csv
 import re
+import tempfile
+from pathlib import Path
 from random import Random
 
 import psycopg
@@ -36,12 +38,23 @@ def insert_papers(connection, abstracts):
         )
 
 
-def collect(database_url, abstracts, synonyms=()):
-    with psycopg.connect(database_url) as connection:
-        insert_papers(connection, abstracts)
-        for key, name in synonyms:
-            connection.execute("INSERT INTO synonym VALUES (%s, %s)", (key, name))
-        return collect_candidates(connection)
+def collect(database_url, abstracts, synonyms=(), file_rows=()):
+    """``synonyms`` go into the ``synonym`` table, ``file_rows`` into a dictionary file."""
+    with tempfile.TemporaryDirectory() as directory:
+        synonyms_file = write_dictionary(Path(directory) / "synonyms.csv", file_rows)
+        with psycopg.connect(database_url) as connection:
+            insert_papers(connection, abstracts)
+            for key, name in synonyms:
+                connection.execute("INSERT INTO synonym VALUES (%s, %s)", (key, name))
+            return collect_candidates(connection, synonyms_file)
+
+
+def write_dictionary(path, rows):
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["normal_form", "canonical_name"])
+        writer.writerows(rows)
+    return path
 
 
 def read_rows(path):
@@ -399,7 +412,7 @@ def test_conflict_is_shown_when_only_the_abbreviation_is_in_synonym_table(databa
     assert set(candidates.conflicts) == {"peft"}
 
 
-def test_reads_abstracts_through_a_streaming_cursor():
+def test_reads_abstracts_through_a_streaming_cursor(tmp_path):
     class Cursor:
         def __enter__(self):
             return self
@@ -419,7 +432,11 @@ def test_reads_abstracts_through_a_streaming_cursor():
         def cursor(self):
             return Cursor()
 
-    assert collect_candidates(Connection()).pairs == {"lora": ("Low-Rank Adaptation", 1)}
+    synonyms_file = write_dictionary(tmp_path / "synonyms.csv", [])
+
+    candidates = collect_candidates(Connection(), synonyms_file)
+
+    assert candidates.pairs == {"lora": ("Low-Rank Adaptation", 1)}
 
 
 def test_empty_corpus_gives_empty_candidates(database_url):
@@ -531,23 +548,22 @@ def test_pair_whose_keys_were_written_under_two_names_is_left_out(tmp_path):
 # --- moving candidate rows into the dictionary ---------------------------------------------
 
 
-def transfer(database_url, tmp_path, dictionary, abstracts):
+def transfer(database_url, tmp_path, dictionary, abstracts, loaded=None):
     """Collect against ``dictionary``, append every candidate row to it, load the result.
+
+    ``dictionary`` is the file the rows are appended to; ``loaded`` is what the ``synonym``
+    table holds, the same rows unless given.
 
     Returns the merged dictionary as ``read_synonyms`` reads it, which raises on a repeated key,
     after checking that the rows rename no dictionary key and that any pair in the corpus whose
     two keys both got a row has one name for both.
     """
-    candidates = collect(database_url, abstracts, synonyms=dictionary)
+    loaded = dictionary if loaded is None else loaded
+    candidates = collect(database_url, abstracts, synonyms=loaded, file_rows=dictionary)
     path = tmp_path / "candidates.csv"
     write_candidates_csv(candidates, path)
     rows = [row[:2] for row in read_rows(path)[1:]]
-    merged_file = tmp_path / "synonyms.csv"
-    with merged_file.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["normal_form", "canonical_name"])
-        writer.writerows(dictionary)
-        writer.writerows(rows)
+    merged_file = write_dictionary(tmp_path / "synonyms.csv", [*dictionary, *rows])
     merged = read_synonyms(merged_file)
     with psycopg.connect(database_url) as connection:
         load_synonyms(connection, merged_file)
@@ -628,6 +644,32 @@ def test_candidate_rows_moved_over_the_dictionary_keep_it_whole(database_url, tm
     # NLProc shares its expansion with NLP, which the dictionary has: no row names either.
     assert "natural language processing" not in merged
     assert "nlproc" not in merged
+
+
+def test_rows_moved_into_the_file_but_not_loaded_are_not_candidates_again(database_url, tmp_path):
+    dictionary = [("lora", "Low-Rank Adaptation"), ("low rank adaptation", "Low-Rank Adaptation")]
+
+    candidates, _ = transfer(database_url, tmp_path, dictionary, [LORA_FULL], loaded=[])
+
+    assert candidates == Candidates(pairs={}, conflicts={})
+
+
+def test_key_only_in_the_dictionary_file_goes_to_conflicts(database_url):
+    candidates = collect(database_url, [LORA_FULL], file_rows=[("lora", "LoRA")])
+
+    assert candidates.pairs == {}
+    assert candidates.conflicts == {"lora": {"Low-Rank Adaptation": 1, "LoRA": 0}}
+
+
+def test_key_the_table_and_the_file_name_differently_goes_to_conflicts(database_url):
+    file_rows = [("lora", "Low-Rank Adaptation"), ("low rank adaptation", "Low-Rank Adaptation")]
+
+    candidates = collect(
+        database_url, [LORA_FULL], synonyms=[("lora", "LoRA")], file_rows=file_rows
+    )
+
+    assert candidates.pairs == {}
+    assert candidates.conflicts == {"lora": {"Low-Rank Adaptation": 1, "LoRA": 0}}
 
 
 def test_abbreviation_that_is_another_ones_expansion_is_not_a_candidate(database_url, tmp_path):

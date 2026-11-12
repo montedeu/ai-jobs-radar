@@ -17,6 +17,7 @@ from pathlib import Path
 import psycopg
 
 from research_radar.normalize import normal_form
+from research_radar.synonyms import SYNONYMS_FILE, read_synonyms
 
 _MAX_EXPANSION_WORDS = 8
 _PARENTHESIS = re.compile(r"\(([^()]*)\)")
@@ -164,9 +165,13 @@ def _spell(abbreviation: str, expansion: str) -> tuple[int, int] | None:
     return best(0, 0)
 
 
-def collect_candidates(connection: psycopg.Connection) -> Candidates:
+def collect_candidates(
+    connection: psycopg.Connection, synonyms_file: Path = SYNONYMS_FILE
+) -> Candidates:
     """Pairs and conflicts over every stored abstract.
 
+    The dictionary is the ``synonym`` table and ``synonyms_file`` together: rows moved into the
+    file count before they are loaded, and a key the two name differently has both names.
     An abbreviation is covered, and left out, when it and all its readings in the corpus are
     dictionary keys under one canonical name. Otherwise it is a candidate when it has one
     reading, its key is no other abbreviation's reading, and neither key is a dictionary key or
@@ -174,7 +179,10 @@ def collect_candidates(connection: psycopg.Connection) -> Candidates:
     with the dictionary's names for its keys at 0 papers. So no candidate key is a dictionary
     key, and candidates share keys only through a common reading.
     """
-    known = dict(connection.execute("SELECT normal_form, canonical_name FROM synonym"))
+    known: dict[str, set[str]] = defaultdict(set)
+    table = connection.execute("SELECT normal_form, canonical_name FROM synonym")
+    for key, name in [*table, *read_synonyms(synonyms_file).items()]:
+        known[key].add(name)
     # abbreviation normal form -> expansion normal form -> spelling -> papers
     spellings: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
     # Streamed: the corpus is every abstract collected, too many to hold at once.
@@ -193,7 +201,7 @@ def collect_candidates(connection: psycopg.Connection) -> Candidates:
     covered = {
         key
         for key, group in keys.items()
-        if group.issubset(known) and len({known[k] for k in group}) == 1
+        if group.issubset(known) and len(set().union(*(known[k] for k in group))) == 1
     }
     by_hand = {
         key
@@ -223,8 +231,8 @@ def collect_candidates(connection: psycopg.Connection) -> Candidates:
     for key, expansions in spellings.items():
         counted = {_most_common(spelled): sum(spelled.values()) for spelled in expansions.values()}
         if key in by_hand:
-            named = sorted({known[k] for k in keys[key] if k in known and known[k] not in counted})
-            conflicts[key] = counted | dict.fromkeys(named, 0)
+            named = set().union(*(known.get(k, set()) for k in keys[key])) - set(counted)
+            conflicts[key] = counted | dict.fromkeys(sorted(named), 0)
         elif key not in covered:
             pairs[key] = next(iter(counted.items()))
     return Candidates(
