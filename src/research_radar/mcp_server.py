@@ -2,10 +2,12 @@
 
 import hmac
 import os
+from datetime import date
 
 import psycopg
 import uvicorn
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -15,6 +17,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from research_radar.database import connect
 from research_radar.history_summary import HistorySummary, history_summary
 from research_radar.job_log import JobRun, error_summary, latest_runs
+from research_radar.search import BadRequest, SearchResult
+from research_radar.search import search_papers as search_papers_in_database
 
 HEALTH_PATH = "/health"
 
@@ -22,7 +26,11 @@ server = MCPServer(
     "ml-research-radar",
     instructions=(
         "Answers which methods, models, tasks and datasets rise and fade in arXiv ML papers. "
-        "An independent project, not endorsed by arXiv."
+        "An independent project, not endorsed by arXiv. "
+        "Tools: service_status (what the database holds), search_papers (find papers by "
+        "text, entity, slice and dates). Every answer of a search starts with a header "
+        "giving the date of calculation, the extraction run, the processed history's end, "
+        "the dictionary's date and the caveats of the service."
     ),
 )
 
@@ -81,6 +89,53 @@ def service_status() -> ServiceStatus:
                 return ServiceStatus(latest_runs=runs, history_error=error_summary(error))
     except psycopg.Error as error:
         raise StatusUnavailable(error_summary(error)) from None
+
+
+class SearchUnavailable(Exception):
+    """The database cannot be read. The message is the error type and SQLSTATE only."""
+
+
+@server.tool()
+def search_papers(
+    query: str | None = None,
+    entity: str | None = None,
+    category: str = "cs.CL",
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: int = 20,
+) -> SearchResult:
+    """Find papers by the text of the title and abstract, by an entity, by slice and by dates.
+
+    `query` is a web-search style text matched against title and abstract; `entity` is an
+    entity in any spelling, matched against the mentions the current extraction run found
+    (any type). Both can be given. `category` is the slice (collected: cs.CL); `date_from`
+    and `date_to` bound the paper's date (first version), both ends included. `limit` is 1
+    to 100. Papers come best text match first, then newest first.
+
+    Each paper has its arXiv id, title, date and link. The answer starts with a header: the
+    date of calculation, the extraction run, the processed history's end, the dictionary's
+    date and the service's caveats. An empty list comes with `message` saying why. A
+    `date_from` after `date_to`, or a limit outside 1 to 100, fails with an explanation.
+    """
+    try:
+        with connect() as connection:
+            # One snapshot for the header and the list.
+            connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            connection.read_only = True
+            return search_papers_in_database(
+                connection,
+                query=query,
+                entity=entity,
+                category=category,
+                date_from=date_from,
+                date_to=date_to,
+                limit=limit,
+            )
+    except BadRequest as error:
+        # The framework shows a client only a ToolError's text.
+        raise ToolError(str(error)) from None
+    except psycopg.Error as error:
+        raise SearchUnavailable(error_summary(error)) from None
 
 
 @server.custom_route(HEALTH_PATH, methods=["GET"])

@@ -60,7 +60,15 @@ def history_summary(connection: psycopg.Connection) -> HistorySummary:
     )
 
 
-def _slice_history(connection: psycopg.Connection, category: str) -> SliceHistory:
+def slice_collected_through(connection: psycopg.Connection, category: str) -> date | None:
+    """Every day up to the returned one is collected for the slice; None if not known."""
+    return _collection_facts(connection, category)[2]
+
+
+def _collection_facts(
+    connection: psycopg.Connection, category: str
+) -> tuple[date | None, datetime | None, date | None]:
+    """backfilled_through, updated_through and the collected_through they give."""
     state = connection.execute(
         "SELECT backfilled_through, updated_through FROM collection_state WHERE category = %s",
         (category,),
@@ -70,7 +78,15 @@ def _slice_history(connection: psycopg.Connection, category: str) -> SliceHistor
         "SELECT status FROM job_run WHERE job = 'backfill' ORDER BY started_at DESC LIMIT 1"
     ).fetchone()
     backfill_succeeded = last_backfill is not None and last_backfill[0] == "succeeded"
-    collected_through = _collected_through(backfilled_through, updated_through, backfill_succeeded)
+    return (
+        backfilled_through,
+        updated_through,
+        _collected_through(backfilled_through, updated_through, backfill_succeeded),
+    )
+
+
+def _slice_history(connection: psycopg.Connection, category: str) -> SliceHistory:
+    backfilled_through, updated_through, collected_through = _collection_facts(connection, category)
     papers_per_day = dict(
         connection.execute(
             """
