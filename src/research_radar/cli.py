@@ -11,6 +11,7 @@ COMMANDS = {
     "backfill": "store the history of every slice, resuming where it stopped",
     "check-jobs": "fail unless a collection job could start (no request to arXiv)",
     "frequencies": "write the shares of the top entities of an extraction run to a Markdown file",
+    "full-run": "estimate and, with --confirm, send the whole history to extraction (paid)",
     "serve-mcp": "serve the MCP server on $PORT",
 }
 
@@ -36,6 +37,9 @@ def main(argv: list[str] | None = None) -> None:
     frequencies.add_argument("--category", default=DEFAULT_CATEGORY, help="the slice")
     frequencies.add_argument("--limit", type=_positive, default=DEFAULT_LIMIT, help="rows")
     frequencies.add_argument("--out", type=Path, required=True, help="the Markdown file to write")
+    parsers["full-run"].add_argument(
+        "--confirm", action="store_true", help="send; without it only the estimate is shown"
+    )
     args = parser.parse_args(argv)
 
     # Imported per command: a job does not pay for loading the web stack.
@@ -63,6 +67,24 @@ def main(argv: list[str] | None = None) -> None:
                 connection, args.run, category=args.category, limit=args.limit
             )
         frequencies.write_table(table, args.out)
+    elif args.command == "full-run":
+        from research_radar import database, extraction, full_run
+        from research_radar.settings import EXTRACTION_MODEL
+
+        # Counting tokens is free, so the estimate uses the real client even without
+        # --confirm; sending and creating the run happen only with it, inside full_run.run.
+        client = extraction.AnthropicModelClient()
+        with database.connect() as connection:
+            # The extraction steps refuse a connection with a transaction open.
+            connection.autocommit = True
+            try:
+                plan = full_run.run(
+                    connection, client, model=EXTRACTION_MODEL, confirm=args.confirm
+                )
+            except extraction.BudgetExceeded as error:
+                raise SystemExit(f"error: {error}") from error
+        if plan.status in (full_run.EMPTY_HISTORY, full_run.BLOCKED):
+            raise SystemExit(1)
     elif args.command == "serve-mcp":
         from research_radar import mcp_server
 

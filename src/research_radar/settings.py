@@ -14,6 +14,10 @@ HISTORY_START = date(2025, 11, 1)
 EXTRACTION_MODEL = "claude-haiku-5-5"
 EXTRACTION_CEILING_USD = Decimal(20)
 
+# Papers in one batch of a full run. The Batches API takes far more per batch; the parts are
+# small so that a stop at the ceiling leaves the parts that fit sent and the rest waiting.
+EXTRACTION_BATCH_SIZE = 5000
+
 # Message Batches price per model, USD per million tokens (input, output). Claude Haiku 5.5
 # for prompts up to 100,000 tokens (an abstract is far below): half of the standard
 # $0.10 / $0.50. A run of a model that is not here cannot be submitted: its cost is unknown.

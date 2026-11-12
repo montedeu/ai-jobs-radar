@@ -164,6 +164,23 @@ class BudgetExceeded(Exception):
     """The batch, with what is already spent, would pass the ceiling."""
 
 
+# The papers a full run is meant to cover: the slices since HISTORY_START, with an id that
+# can be extracted at all. start_run snapshots it; the full-run plan counts it before any
+# run exists.
+SCOPE_SQL = """
+    SELECT p.arxiv_id FROM paper p
+     WHERE p.first_version_date >= %(start)s
+       AND p.arxiv_id ~ %(shape)s
+       AND EXISTS (SELECT 1 FROM paper_category c
+                    WHERE c.arxiv_id = p.arxiv_id AND c.category = ANY(%(slices)s))
+"""
+SCOPE_PARAMS = {
+    "start": HISTORY_START,
+    "shape": f"^{_ARXIV_ID.pattern}$",
+    "slices": list(CATEGORIES),
+}
+
+
 def start_run(
     connection: psycopg.Connection,
     *,
@@ -197,20 +214,9 @@ def start_run(
         ).fetchone()[0]
         if full:
             connection.execute(
-                """
-                INSERT INTO extraction_run_scope (run_id, arxiv_id)
-                SELECT %(run)s, p.arxiv_id FROM paper p
-                 WHERE p.first_version_date >= %(start)s
-                   AND p.arxiv_id ~ %(shape)s
-                   AND EXISTS (SELECT 1 FROM paper_category c
-                                WHERE c.arxiv_id = p.arxiv_id AND c.category = ANY(%(slices)s))
-                """,
-                {
-                    "run": run_id,
-                    "start": HISTORY_START,
-                    "shape": f"^{_ARXIV_ID.pattern}$",
-                    "slices": list(CATEGORIES),
-                },
+                "INSERT INTO extraction_run_scope (run_id, arxiv_id)"
+                " SELECT %(run)s, s.arxiv_id FROM (" + SCOPE_SQL + ") s",
+                {**SCOPE_PARAMS, "run": run_id},
             )
     return run_id
 
