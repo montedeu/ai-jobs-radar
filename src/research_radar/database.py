@@ -60,3 +60,12 @@ def connect(url: str | None = None) -> psycopg.Connection:
                 raise
             time.sleep(attempt)
     raise AssertionError("unreachable")
+
+
+def require_direct(connection: psycopg.Connection) -> None:
+    """Raises unless the connection is a direct one: a session-level advisory lock is held
+    by the session, and behind a pooler a session is not ours, so the lock would be handed
+    to whoever gets the backend next. direct_url() has already left the pooler if it knew
+    how; this catches the rest."""
+    if "-pooler" in (connection.info.host or ""):
+        raise RuntimeError("still connected through Neon's pooler; jobs need the direct URL")

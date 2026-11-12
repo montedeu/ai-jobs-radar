@@ -6,14 +6,15 @@ the parts already sent in the database and the next start continues the same run
 the answers and making the run current is the daily job's work (runs.promote).
 """
 
+import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 import psycopg
 
-from research_radar import extraction, runs
+from research_radar import database, extraction, runs
 from research_radar.extraction import (
     DEFAULT_CONFIG,
     BudgetExceeded,
@@ -34,9 +35,12 @@ NOTHING_TO_SEND = "nothing_to_send"
 BLOCKED = "blocked"
 NEWER_RUN_OTHER_CONFIG = "newer_run_other_config"
 LOCKED = "locked"
+STUCK_SENDING = "stuck_sending"
+
+log = logging.getLogger(__name__)
 
 # One command at a time: two would each count what is in flight before either sent.
-_LOCK_SQL = "pg_try_advisory_lock(hashtext('full_run'))"
+LOCK_KEY = "full_run"
 
 
 @dataclass(frozen=True)
@@ -57,16 +61,14 @@ class FullRunPlan:
     @property
     def refused(self) -> bool:
         """The command can do nothing useful, and the caller should fail."""
-        return self.status in (EMPTY_HISTORY, BLOCKED, NEWER_RUN_OTHER_CONFIG, LOCKED) or (
-            self.status == NOTHING_TO_SEND and self.sending > 0
+        return self.status in (
+            EMPTY_HISTORY,
+            BLOCKED,
+            NEWER_RUN_OTHER_CONFIG,
+            LOCKED,
+            STUCK_SENDING,
         )
 
-
-_IN_FLIGHT_SQL = """
-    SELECT DISTINCT bp.arxiv_id
-      FROM extraction_batch b JOIN extraction_batch_paper bp ON bp.batch_id = b.id
-     WHERE b.run_id = %s AND b.status IN ('sending', 'submitted')
-"""
 
 _RESTART_HINT = (
     "Sort out the batches stuck in 'sending', or run again with --confirm --restart: "
@@ -105,7 +107,9 @@ def _prepare(
             requests = _requests(connection, ids)
             input_tokens = client.count_tokens(requests, model=model, config=config)
             # The output is counted at the cap for every paper, as submit does.
-            estimated = extraction._usd(model, input_tokens, len(ids) * config.max_output_tokens)
+            estimated = extraction.estimate_usd(
+                model, input_tokens, len(ids) * config.max_output_tokens
+            )
         batches = math.ceil(len(ids) / EXTRACTION_BATCH_SIZE)
         found = FullRunPlan(
             fields.pop("run_id", None),
@@ -121,7 +125,7 @@ def _prepare(
 
     pinned = extraction.config_hash(config, model)
     current = runs.current_run(connection)
-    if current is not None:
+    if current is not None and not restart:
         same = connection.execute(
             "SELECT model = %s AND prompt_hash = %s FROM extraction_run WHERE id = %s",
             (model, pinned, current),
@@ -145,10 +149,7 @@ def _prepare(
         # switches to a run older than the current one.
         return result(NEWER_RUN_OTHER_CONFIG, other_run=head)
     state = runs.run_state(connection, head)
-    in_flight = {r[0] for r in connection.execute(_IN_FLIGHT_SQL, (head,))}
-    sending = connection.execute(
-        "SELECT count(*) FROM extraction_batch WHERE run_id = %s AND status = 'sending'", (head,)
-    ).fetchone()[0]
+    in_flight, sending = _in_flight(connection, head)
     fields = {
         "run_id": head,
         "in_flight": len(in_flight),
@@ -156,6 +157,10 @@ def _prepare(
         "scope": state.scope,
         "sending": sending,
     }
+    if sending:
+        # A batch in 'sending' may or may not have left; more parts on top of it could pay
+        # twice for what it carries.
+        return result(STUCK_SENDING, **fields)
     if state.blocked:
         # Whatever is still missing, the run will not become current: sending more is wasted.
         return result(BLOCKED, **fields)
@@ -163,6 +168,13 @@ def _prepare(
     if to_send:
         return result(READY, to_send, **fields)
     return result(NOTHING_TO_SEND, **fields)
+
+
+def _in_flight(connection: psycopg.Connection, run_id: int) -> tuple[set[str], int]:
+    """The papers the run has in an uncollected batch, and how many of its batches are
+    stuck in 'sending'."""
+    rows = connection.execute(extraction.IN_FLIGHT_SQL, {"run": run_id}).fetchall()
+    return {row[0] for row in rows}, len({row[2] for row in rows if row[3] == "sending"})
 
 
 def _requests(connection: psycopg.Connection, ids: list[str]) -> list[ExtractionRequest]:
@@ -191,10 +203,13 @@ def run(
     parts is normal for a history this size: the rest waits until the daily job has
     collected the parts sent. A stop before the first part raises BudgetExceeded.
     """
+    database.require_direct(connection)
     extraction.require_idle(connection)
     if restart and not confirm:
         raise ValueError("restart needs confirm")
-    if not connection.execute("SELECT " + _LOCK_SQL).fetchone()[0]:
+    if not connection.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (LOCK_KEY,)).fetchone()[
+        0
+    ]:
         out("Another full-run command is already running; nothing was done.")
         return FullRunPlan(
             None, 0, 0, Decimal(0), Decimal(0), EXTRACTION_CEILING_USD, status=LOCKED
@@ -202,7 +217,13 @@ def run(
     try:
         return _run_locked(connection, client, model, config, confirm, restart, out)
     finally:
-        connection.execute("SELECT pg_advisory_unlock(hashtext('full_run'))")
+        # A broken connection took the lock with it; failing here would hide the error
+        # that broke it.
+        if not connection.closed:
+            try:
+                connection.execute("SELECT pg_advisory_unlock(hashtext(%s))", (LOCK_KEY,))
+            except psycopg.Error:
+                log.warning("could not release the full-run lock", exc_info=True)
 
 
 def _run_locked(
@@ -236,6 +257,10 @@ def _run_locked(
     out(f"Sending {len(ids)} papers in {len(parts)} parts.")
     sent = skipped = 0
     for index, part in enumerate(parts):
+        stop = _stop_before_part(connection, run_id)
+        if stop is not None:
+            _print_stop(found, stop, run_id, sent, skipped, len(parts) - index, out)
+            return replace(found, status=stop, run_id=run_id)
         try:
             if extraction.submit(connection, client, run_id, part) is None:
                 skipped += 1
@@ -263,6 +288,34 @@ def _run_locked(
     return found
 
 
+def _stop_before_part(connection: psycopg.Connection, run_id: int) -> str | None:
+    """Why no further part may be sent: what was true at the plan can change under a long
+    send (a collected batch can push the run over the limit, a send can be left hanging)."""
+    if _in_flight(connection, run_id)[1]:
+        return STUCK_SENDING
+    if runs.run_state(connection, run_id).blocked:
+        return BLOCKED
+    return None
+
+
+def _print_stop(
+    found: FullRunPlan,
+    stop: str,
+    run_id: int,
+    sent: int,
+    skipped: int,
+    left: int,
+    out: Callable[[str], None],
+) -> None:
+    why = (
+        "a batch of the run is stuck in 'sending'"
+        if stop == STUCK_SENDING
+        else "the run gave up on too many papers and will not become current"
+    )
+    out(f"Stopped before the next part of run {run_id}: {why}. {_RESTART_HINT}")
+    out(f"Sent {sent}, skipped {skipped}, left {left}.")
+
+
 def _print_plan(found: FullRunPlan, out: Callable[[str], None]) -> None:
     if found.status == EMPTY_HISTORY:
         out("There is no collected history to extract: no paper is in scope, nothing to send.")
@@ -270,7 +323,9 @@ def _print_plan(found: FullRunPlan, out: Callable[[str], None]) -> None:
     if found.status == ALREADY_CURRENT:
         out(
             "A full run with this model and request configuration is already current: "
-            "nothing to send."
+            "nothing to send. To pay for the whole history again anyway (for example after "
+            "adding a slice to CATEGORIES, which the configuration hash does not cover), "
+            "run with --confirm --restart."
         )
         return
     if found.status == NEWER_RUN_OTHER_CONFIG:
@@ -278,6 +333,12 @@ def _print_plan(found: FullRunPlan, out: Callable[[str], None]) -> None:
             f"There is a newer unfinished full run {found.other_run} with another "
             "configuration; continuing the older one is pointless, and nothing was created."
             f" {_RESTART_HINT}"
+        )
+        return
+    if found.status == STUCK_SENDING:
+        out(
+            f"The run {found.run_id} has {found.sending} batches stuck in 'sending': they may "
+            f"or may not have left, so nothing more is sent. {_RESTART_HINT}"
         )
         return
     if found.status == BLOCKED:
@@ -293,8 +354,6 @@ def _print_plan(found: FullRunPlan, out: Callable[[str], None]) -> None:
     )
     if found.status == NOTHING_TO_SEND:
         out("There is nothing to send: every paper of the run is marked, in flight or given up.")
-        if found.sending:
-            out(f"{found.sending} batches are stuck in 'sending'. {_RESTART_HINT}")
         return
     out(
         f"Cost estimated at ${found.estimated_usd:.4f}; spent so far ${found.spent_usd:.4f}; "

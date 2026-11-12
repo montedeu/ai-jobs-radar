@@ -5,7 +5,7 @@ import psycopg
 import pytest
 from fakes import FakeModel
 
-from research_radar import cli, extraction, full_run, runs
+from research_radar import cli, database, extraction, full_run, runs
 from research_radar.extraction import (
     DEFAULT_CONFIG,
     BudgetExceeded,
@@ -125,7 +125,9 @@ def spend(connection, usd):
 
 
 def part_cost(papers):
-    return extraction._usd(EXTRACTION_MODEL, 1000 * papers, papers * EXTRACTION_MAX_OUTPUT_TOKENS)
+    return extraction.estimate_usd(
+        EXTRACTION_MODEL, 1000 * papers, papers * EXTRACTION_MAX_OUTPUT_TOKENS
+    )
 
 
 def mark_done(connection, run_id, *arxiv_ids):
@@ -356,18 +358,21 @@ def test_model_without_batch_prices_fails_in_the_plan_before_any_run(connection,
     assert count(connection, "extraction_run") == 0
 
 
-def test_client_error_keeps_the_parts_already_sent_and_a_rerun_continues(connection, papers):
+def test_client_error_keeps_the_parts_sent_and_the_stuck_part_stops_a_rerun(connection, papers):
     client = FailsOnSecondSubmit()
     with pytest.raises(RuntimeError, match="connection lost"):
         go(connection, client)
     assert sent_ids(client) == IDS[:2]
     second = PerPaperModel()
 
-    go(connection, second)
+    plan, text = go(connection, second)
 
+    # The part whose send failed is 'sending': it may have left, so nothing more is paid for.
+    assert plan.status == full_run.STUCK_SENDING
+    assert plan.refused
+    assert "--restart" in text
+    assert second.calls == []
     assert count(connection, "extraction_run") == 1
-    # The part whose send failed was recorded as 'sending' and may have left: not sent again.
-    assert sent_ids(second) == IDS[4:]
 
 
 @pytest.fixture
@@ -474,8 +479,8 @@ def test_papers_all_stuck_in_sending_say_what_to_do(connection, papers):
 
     plan, text = go(connection, client)
 
-    assert plan.status == full_run.NOTHING_TO_SEND
-    assert plan.refused
+    assert plan.status == full_run.STUCK_SENDING
+    assert plan.sending == 1
     assert "sending" in text
     assert "--restart" in text
     assert client.calls == []
@@ -536,3 +541,115 @@ def test_the_actual_number_of_papers_is_printed_after_the_run_is_created(connect
 
     assert "Sending 5 papers in 3 parts" in text
     assert "slightly higher" in text
+
+
+def test_restart_beats_an_already_current_run(connection, papers):
+    run_id = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    mark_done(connection, run_id, *IDS)
+    assert runs.promote(connection) == run_id
+    client = PerPaperModel()
+
+    plan, text = go(connection, client, confirm=False)
+    assert plan.status == full_run.ALREADY_CURRENT
+    assert "--restart" in text
+
+    plan, _ = go(connection, client, restart=True)
+
+    assert plan.run_id is None
+    assert count(connection, "extraction_run") == 2
+    assert sent_ids(client) == IDS
+
+
+def test_a_run_blocked_between_parts_stops_the_rest(connection, papers, monkeypatch):
+    real = extraction.submit
+    calls = []
+
+    def submit(connection, client, run_id, part, **kwargs):
+        calls.append(part)
+        result = real(connection, client, run_id, part, **kwargs)
+        if len(calls) == 1:
+            for arxiv_id in IDS[2:4]:
+                give_up_on(connection, run_id, arxiv_id)
+        return result
+
+    monkeypatch.setattr(extraction, "submit", submit)
+    client = PerPaperModel()
+
+    plan, text = go(connection, client)
+
+    assert len(calls) == 1
+    assert plan.status == full_run.BLOCKED
+    assert plan.refused
+    assert "will not become current" in text
+    assert "left 2" in text
+
+
+def test_a_batch_stuck_in_sending_between_parts_stops_the_rest(connection, papers, monkeypatch):
+    real = extraction.submit
+    calls = []
+
+    def submit(connection, client, run_id, part, **kwargs):
+        calls.append(part)
+        result = real(connection, client, run_id, part, **kwargs)
+        batch_id = connection.execute(
+            "INSERT INTO extraction_batch (run_id, status, estimated_cost_usd)"
+            " VALUES (%s, 'sending', 0) RETURNING id",
+            (run_id,),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash)"
+            " SELECT %s, arxiv_id, abstract_hash FROM paper WHERE arxiv_id = %s",
+            (batch_id, IDS[4]),
+        )
+        return result
+
+    monkeypatch.setattr(extraction, "submit", submit)
+
+    plan, text = go(connection, PerPaperModel())
+
+    assert len(calls) == 1
+    assert plan.status == full_run.STUCK_SENDING
+    assert "--restart" in text
+    assert "left 2" in text
+
+
+def test_releasing_the_lock_does_not_hide_the_original_error(connection, papers, monkeypatch):
+    def submit(connection, *args, **kwargs):
+        connection.close()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(extraction, "submit", submit)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        go(connection, PerPaperModel())
+
+
+def test_command_refuses_a_pooled_connection_before_doing_anything(connection, monkeypatch):
+    class Pooled:
+        host = "ep-example-pooler.eu-central-1.aws.neon.tech"
+
+    monkeypatch.setattr(psycopg.Connection, "info", Pooled(), raising=False)
+    client = PerPaperModel()
+
+    with pytest.raises(RuntimeError, match="direct URL"):
+        full_run.run(connection, client, model=EXTRACTION_MODEL, confirm=True)
+
+    assert client.calls == []
+
+
+def test_cli_connects_to_the_direct_address_of_a_pooled_url(
+    monkeypatch, cli_client, database_url, papers
+):
+    asked = []
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@ep-a-1-pooler.x.neon.tech/db")
+
+    def connect(url):
+        asked.append(url)
+        return psycopg.connect(database_url)
+
+    monkeypatch.setattr(database, "connect", connect)
+
+    cli.main(["full-run"])
+
+    assert len(asked) == 1
+    assert "ep-a-1.x.neon.tech" in asked[0] and "pooler" not in asked[0]

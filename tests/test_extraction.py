@@ -56,7 +56,7 @@ SURVEY_ANSWER = ExtractionResult("2511.00002", PaperMentions(mentions=[]), 90, 5
 
 
 def usd(input_tokens, output_tokens):
-    return extraction._usd(EXTRACTION_MODEL, input_tokens, output_tokens)
+    return extraction.estimate_usd(EXTRACTION_MODEL, input_tokens, output_tokens)
 
 
 @pytest.fixture
@@ -637,7 +637,9 @@ def test_run_model_is_what_the_client_is_called_with_and_priced_by(connection, m
     estimate = connection.execute(
         "SELECT estimated_cost_usd FROM extraction_batch WHERE id = %s", (batch_id,)
     ).fetchone()[0]
-    assert estimate == extraction._usd("other-model", 1_000_000, EXTRACTION_MAX_OUTPUT_TOKENS)
+    assert estimate == extraction.estimate_usd(
+        "other-model", 1_000_000, EXTRACTION_MAX_OUTPUT_TOKENS
+    )
 
 
 def test_submit_sends_the_text_and_hash_stored_in_the_database(connection):

@@ -221,7 +221,7 @@ def start_run(
     return run_id
 
 
-def _usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+def estimate_usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
     price_in, price_out = BATCH_PRICES_USD_PER_MTOK[model]
     return (Decimal(input_tokens) * price_in + Decimal(output_tokens) * price_out) / 1_000_000
 
@@ -239,6 +239,15 @@ GIVEN_UP_SQL = """
      WHERE b.run_id = %(run)s AND b.status = 'collected' AND bp.outcome IN ('invalid', 'errored')
      GROUP BY bp.arxiv_id, bp.abstract_hash
     HAVING count(*) >= %(attempts)s
+"""
+
+
+# The papers a run has out in a batch that is not collected: still sending (nobody knows
+# whether it left) or submitted. _due leaves them out; the full-run plan counts them.
+IN_FLIGHT_SQL = """
+    SELECT bp.arxiv_id, bp.abstract_hash, b.id AS batch_id, b.status
+      FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
+     WHERE b.run_id = %(run)s AND b.status IN ('sending', 'submitted')
 """
 
 
@@ -299,7 +308,7 @@ def submit(
             [request for request, _ in todo], model=model, config=config
         )
         # The output is counted at the cap for every paper: the real size is not known before.
-        estimate = _usd(model, input_tokens, len(todo) * config.max_output_tokens)
+        estimate = estimate_usd(model, input_tokens, len(todo) * config.max_output_tokens)
         with connection.transaction():
             # Two submits at once would each see the same spent money and both pass the ceiling.
             connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
@@ -413,10 +422,10 @@ def _due(
             SELECT arxiv_id, abstract_hash FROM paper_extraction
              WHERE run_id = %(run)s AND arxiv_id = ANY(%(ids)s)
             UNION
-            SELECT bp.arxiv_id, bp.abstract_hash
-              FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
-             WHERE b.run_id = %(run)s AND b.status IN ('sending', 'submitted')
-               AND bp.arxiv_id = ANY(%(ids)s)
+            SELECT f.arxiv_id, f.abstract_hash FROM ("""
+            + IN_FLIGHT_SQL
+            + """) f
+             WHERE f.arxiv_id = ANY(%(ids)s)
             UNION
             SELECT g.arxiv_id, g.abstract_hash FROM ("""
             + GIVEN_UP_SQL
@@ -540,7 +549,7 @@ def _store_batch(
            SET status = 'collected', collected_at = now(), actual_cost_usd = %s
          WHERE id = %s
         """,
-        (_usd(model, input_tokens, output_tokens), batch_id),
+        (estimate_usd(model, input_tokens, output_tokens), batch_id),
     )
     return +counter  # drops zero counts
 

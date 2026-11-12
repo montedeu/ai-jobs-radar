@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "frequencies":
         from research_radar import database, frequencies
 
-        with database.connect() as connection:
+        with database.connect(database.direct_url(database.database_url())) as connection:
             table = frequencies.top_entities(
                 connection, args.run, category=args.category, limit=args.limit
             )
@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> None:
         # Counting tokens is free, so the estimate uses the real client even without
         # --confirm; sending and creating the run happen only with it, inside full_run.run.
         client = extraction.AnthropicModelClient()
-        with database.connect() as connection:
+        with database.connect(database.direct_url(database.database_url())) as connection:
             # The extraction steps refuse a connection with a transaction open.
             connection.autocommit = True
             try:

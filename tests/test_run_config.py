@@ -141,7 +141,7 @@ def test_estimate_uses_the_runs_max_output_tokens(connection):
     stored = connection.execute(
         "SELECT estimated_cost_usd FROM extraction_batch WHERE id = %s", (batch_id,)
     ).fetchone()[0]
-    assert stored == extraction._usd(EXTRACTION_MODEL, 1_000_000, 512)
+    assert stored == extraction.estimate_usd(EXTRACTION_MODEL, 1_000_000, 512)
 
 
 def test_run_from_before_the_migration_is_refused_and_left_as_it_was(connection):
