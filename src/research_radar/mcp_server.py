@@ -3,6 +3,7 @@
 import hmac
 import os
 
+import psycopg
 import uvicorn
 from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel
@@ -12,6 +13,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from research_radar.database import connect
+from research_radar.history_summary import HistorySummary, history_summary
 from research_radar.job_log import JobRun, latest_runs
 
 HEALTH_PATH = "/health"
@@ -27,13 +29,29 @@ server = MCPServer(
 
 class ServiceStatus(BaseModel):
     latest_runs: list[JobRun]
+    # None, with history_error set, when the summary could not be read.
+    history: HistorySummary | None = None
+    history_error: str | None = None
 
 
 @server.tool()
 def service_status() -> ServiceStatus:
-    """When each of the radar's scheduled jobs last ran and how it ended."""
+    """When each scheduled job last ran and how it ended, and what the database holds.
+
+    `history` gives, per slice, the papers per calendar month (by paper date), the backfill
+    boundary, the last arXiv update time stored, `collected_through` (every day up to it is
+    collected), and the days up to it without a paper. It also gives, once for the whole
+    answer, when the daily collection last succeeded and the database size. If the summary
+    cannot be read, `history` is empty and `history_error` says why; `latest_runs` stays.
+    """
     with connect() as connection:
-        return ServiceStatus(latest_runs=latest_runs(connection))
+        runs = latest_runs(connection)
+        # Ends the transaction the read above began; the summary needs a fresh one.
+        connection.commit()
+        try:
+            return ServiceStatus(latest_runs=runs, history=history_summary(connection))
+        except psycopg.Error as error:
+            return ServiceStatus(latest_runs=runs, history_error=f"{type(error).__name__}: {error}")
 
 
 @server.custom_route(HEALTH_PATH, methods=["GET"])
