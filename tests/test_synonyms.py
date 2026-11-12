@@ -6,6 +6,7 @@ names through the ``paper_entity`` view, with no extraction run.
 
 import psycopg
 import pytest
+
 from research_radar.normalize import normal_form
 from research_radar.synonyms import SYNONYMS_FILE, load_synonyms, read_synonyms
 
