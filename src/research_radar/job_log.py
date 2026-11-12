@@ -19,6 +19,17 @@ class JobRun(BaseModel):
     details: dict[str, Any]
 
 
+def error_summary(error: BaseException) -> str:
+    """The error type, and the SQLSTATE of a database error: nothing a message could carry.
+
+    psycopg messages can name the database host and user, so this is all that goes where
+    the developer's log is not the only reader.
+    """
+    sqlstate = error.sqlstate if isinstance(error, psycopg.Error) else None
+    name = type(error).__name__
+    return f"{name} (SQLSTATE {sqlstate})" if sqlstate else name
+
+
 class RunSkipped(Exception):
     """Raised inside ``record_run`` when the job has nothing to do and nothing is wrong."""
 

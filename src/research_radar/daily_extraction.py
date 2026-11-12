@@ -14,7 +14,7 @@ import psycopg
 
 from research_radar import extraction, runs, settings
 from research_radar.database import connect, database_url, direct_url, require_direct
-from research_radar.job_log import RunSkipped, record_run
+from research_radar.job_log import RunSkipped, error_summary, record_run
 from research_radar.settings import (
     EXTRACTION_DAILY_MAX_PAPERS,
     EXTRACTION_MAX_ATTEMPTS,
@@ -107,7 +107,8 @@ def _collect_all(
             except RunSkipped:
                 raise
             except Exception as error:
-                errors[str(batch_id)] = f"{type(error).__name__}: {error}"
+                # A failure's text can carry a host or a key, and the service shows this row.
+                errors[str(batch_id)] = error_summary(error)
                 continue
             collected += counts
             ended += any(counts[key] for key in ("extracted", "failed", "stale"))
@@ -137,6 +138,20 @@ def _submit_all(
             details["submitted"] += len(part)
 
 
+def _note_full_run_missing(connection: psycopg.Connection, details: dict[str, Any]) -> None:
+    """How many papers the newest unfinished full run still lacks, as of after the sending.
+
+    A failure here leaves None: a log field must not stop the step or hide its own error.
+    """
+    try:
+        head = runs.head_candidate(connection)
+        details["full_run_missing"] = (
+            None if head is None else runs.run_state(connection, head).missing
+        )
+    except psycopg.Error:
+        details["full_run_missing"] = None
+
+
 def extract_daily(
     connection: psycopg.Connection,
     client_factory: Callable[[], extraction.ModelClient],
@@ -158,6 +173,7 @@ def extract_daily(
         current_run=None,
         due=0,
         gave_up=0,
+        full_run_missing=None,
         submitted=0,
         submitted_batches=[],
     )
@@ -178,6 +194,7 @@ def extract_daily(
                 client.resolve()
                 _submit_all(connection, client, run_id, due, details)
     finally:
+        _note_full_run_missing(connection, details)
         try:
             details["spent_usd"] = str(extraction.spent_usd(connection))
         except psycopg.Error:

@@ -125,6 +125,10 @@ class ExtractionResult:
     unanswered: str | None = None
 
 
+class BatchNotAbandonable(ValueError):
+    """The batch is in a status that abandon_batch was not asked to give up."""
+
+
 class BatchRejected(Exception):
     """The API refused to create the batch outright: nothing was created, nothing is billed.
 
@@ -271,6 +275,47 @@ def spent_usd(connection: psycopg.Connection) -> Decimal:
     ).fetchone()[0]
 
 
+def abandon_batch(
+    connection: psycopg.Connection,
+    batch_id: int,
+    *,
+    statuses: tuple[str, ...] = ("sending", "submitted"),
+) -> int:
+    """Gives up a batch that is in one of ``statuses``; returns the number of its papers.
+
+    The batch stays in spent_usd at its estimate: nobody knows whether it left, or what a
+    submitted one will still cost. Its papers stop counting as in flight, so they are due
+    again; if the batch did go out, they are paid for twice. collect leaves it alone.
+    Raises LookupError for an unknown batch and BatchNotAbandonable (a ValueError) for one in
+    another status.
+    The connection must have no transaction open.
+    """
+    if isinstance(statuses, str):
+        raise TypeError("statuses is a tuple of statuses, not one string")
+    require_idle(connection)
+    with connection.transaction():
+        # The update takes the row lock, so a collector storing the batch at this moment
+        # finishes first (and then this finds it 'collected') or sees 'abandoned' after.
+        given_up = connection.execute(
+            "UPDATE extraction_batch SET status = 'abandoned'"
+            " WHERE id = %s AND status = ANY(%s) RETURNING id",
+            (batch_id, list(statuses)),
+        ).fetchone()
+        if given_up is None:
+            row = connection.execute(
+                "SELECT status FROM extraction_batch WHERE id = %s", (batch_id,)
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"no extraction batch {batch_id}")
+            raise BatchNotAbandonable(
+                f"batch {batch_id} is {row[0]}; only a batch that is {' or '.join(statuses)} "
+                "can be abandoned"
+            )
+        return connection.execute(
+            "SELECT count(*) FROM extraction_batch_paper WHERE batch_id = %s", (batch_id,)
+        ).fetchone()[0]
+
+
 def submit(
     connection: psycopg.Connection,
     client: ModelClient,
@@ -347,15 +392,33 @@ def submit(
         )
     except BatchRejected:
         with connection.transaction():
+            # A batch given up while it was being sent stays given up: 'rejected' would
+            # take its estimate out of spent_usd, and nobody knows what the provider did.
             connection.execute(
-                "UPDATE extraction_batch SET status = 'rejected' WHERE id = %s", (batch_id,)
+                "UPDATE extraction_batch SET status = 'rejected'"
+                " WHERE id = %s AND status = 'sending'",
+                (batch_id,),
             )
         raise
     with connection.transaction():
-        connection.execute(
+        updated = connection.execute(
             "UPDATE extraction_batch SET provider_batch_id = %s, status = 'submitted'"
-            " WHERE id = %s",
+            " WHERE id = %s AND status = 'sending'",
             (provider_batch_id, batch_id),
+        ).rowcount
+        if not updated:
+            # Given up while the request was in flight: keep the status, so the estimate
+            # stays in spent_usd and collect leaves it alone, but record where it went.
+            connection.execute(
+                "UPDATE extraction_batch SET provider_batch_id = %s WHERE id = %s",
+                (provider_batch_id, batch_id),
+            )
+    if not updated:
+        log.warning(
+            "batch %s left after it was abandoned: its papers may be paid for twice; "
+            "provider batch id %s",
+            batch_id,
+            provider_batch_id,
         )
     return batch_id
 
