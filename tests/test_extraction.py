@@ -22,6 +22,7 @@ from research_radar.extraction import (
 from research_radar.mentions import Mention, PaperMentions
 from research_radar.papers import abstract_hash
 from research_radar.settings import (
+    EXTRACTION_MAX_ATTEMPTS,
     EXTRACTION_MAX_OUTPUT_TOKENS,
     EXTRACTION_MODEL,
 )
@@ -435,7 +436,9 @@ def test_batch_entry_that_was_not_answered_is_a_result_without_mentions_and_toke
     # It must be in the stream, or the batch would look cut off (see "incomplete").
     entry = batch_entry(result_type)
     entry.custom_id = "2511_00001"
-    assert extraction.result_from_batch_entry(entry) == ExtractionResult("2511.00001", None, 0, 0)
+    assert extraction.result_from_batch_entry(entry) == ExtractionResult(
+        "2511.00001", None, 0, 0, unanswered=result_type
+    )
 
 
 def advisory_locks(connection):
@@ -986,3 +989,66 @@ def test_title_changed_while_counting_is_counted_again_too(connection):
     submit(connection, model, new_run(connection), [LORA.arxiv_id])
     assert model.calls == ["count_tokens", "count_tokens", "submit_batch"]
     assert model.sent[0][0].title == "A longer, new title"
+
+
+def outcomes(connection):
+    return dict(
+        connection.execute(
+            'SELECT arxiv_id, outcome FROM extraction_batch_paper ORDER BY arxiv_id COLLATE "C"'
+        ).fetchall()
+    )
+
+
+def test_collect_records_what_became_of_each_paper(connection):
+    unanswered = ExtractionRequest("2511.00003", "Third", "Nothing came back.")
+    add_papers(connection, LORA, SURVEY, unanswered)
+    model = FakeModel(
+        LORA_ANSWER,
+        ExtractionResult(SURVEY.arxiv_id, None, 90, 5),
+        ExtractionResult(unanswered.arxiv_id, None, 0, 0, unanswered="expired"),
+    )
+    run_batch(connection, model, new_run(connection), LORA, SURVEY, unanswered)
+    assert outcomes(connection) == {
+        LORA.arxiv_id: "extracted",
+        SURVEY.arxiv_id: "invalid",
+        unanswered.arxiv_id: "expired",
+    }
+
+
+def test_collect_records_a_stale_answer_as_stale(connection):
+    add_papers(connection, LORA)
+    model = FakeModel(LORA_ANSWER)
+    run_id = new_run(connection)
+    batch_id = submit(connection, model, run_id, [LORA.arxiv_id])
+    connection.execute("UPDATE paper SET abstract_hash = 'changed'")
+    collect(connection, model, batch_id)
+    assert outcomes(connection) == {LORA.arxiv_id: "stale"}
+
+
+def test_submit_does_not_send_a_paper_the_run_gave_up_on(connection):
+    add_papers(connection, LORA)
+    model = FakeModel(ExtractionResult(LORA.arxiv_id, None, 120, 40))
+    run_id = new_run(connection)
+    for _ in range(EXTRACTION_MAX_ATTEMPTS):
+        run_batch(connection, model, run_id, LORA)
+    assert submit(connection, model, run_id, [LORA.arxiv_id]) is None
+    # Another run starts afresh, and so does a changed abstract.
+    assert submit(connection, model, new_run(connection), [LORA.arxiv_id]) is not None
+
+
+def test_a_request_that_always_errors_makes_submit_give_up(connection):
+    add_papers(connection, LORA)
+    model = FakeModel(ExtractionResult(LORA.arxiv_id, None, 0, 0, unanswered="errored"))
+    run_id = new_run(connection)
+    for _ in range(EXTRACTION_MAX_ATTEMPTS):
+        run_batch(connection, model, run_id, LORA)
+    assert submit(connection, model, run_id, [LORA.arxiv_id]) is None
+
+
+def test_expired_requests_do_not_make_submit_give_up(connection):
+    add_papers(connection, LORA)
+    model = FakeModel(ExtractionResult(LORA.arxiv_id, None, 0, 0, unanswered="expired"))
+    run_id = new_run(connection)
+    for _ in range(EXTRACTION_MAX_ATTEMPTS):
+        run_batch(connection, model, run_id, LORA)
+    assert submit(connection, model, run_id, [LORA.arxiv_id]) is not None

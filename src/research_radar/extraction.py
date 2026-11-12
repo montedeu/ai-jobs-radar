@@ -21,8 +21,11 @@ from research_radar.normalize import normal_form
 from research_radar.papers import text_hash
 from research_radar.settings import (
     BATCH_PRICES_USD_PER_MTOK,
+    CATEGORIES,
     EXTRACTION_CEILING_USD,
+    EXTRACTION_MAX_ATTEMPTS,
     EXTRACTION_MAX_OUTPUT_TOKENS,
+    HISTORY_START,
 )
 
 log = logging.getLogger(__name__)
@@ -60,6 +63,9 @@ class ExtractionResult:
     mentions: PaperMentions | None
     input_tokens: int
     output_tokens: int
+    # How a request that got no answer ended: "errored", "expired" or "canceled". None for
+    # a request the model answered, usable or not.
+    unanswered: str | None = None
 
 
 class BatchRejected(Exception):
@@ -98,13 +104,44 @@ class BudgetExceeded(Exception):
 
 
 def start_run(
-    connection: psycopg.Connection, *, model: str, prompt_hash: str, note: str = ""
+    connection: psycopg.Connection,
+    *,
+    model: str,
+    prompt_hash: str,
+    note: str = "",
+    full: bool = False,
 ) -> int:
-    run_id = connection.execute(
-        "INSERT INTO extraction_run (model, prompt_hash, note) VALUES (%s, %s, %s) RETURNING id",
-        (model, prompt_hash, note),
-    ).fetchone()[0]
-    connection.commit()
+    """Creates a run. A full run is one meant to cover the whole history (see runs.py).
+
+    A full run also records its scope in the same transaction: the papers of the slices
+    since HISTORY_START that exist now, with an id that can be extracted at all. Papers
+    that come later, or gain a slice later, are not in it; the daily job sends them to
+    the current run.
+    """
+    require_idle(connection)
+    with connection.transaction():
+        run_id = connection.execute(
+            "INSERT INTO extraction_run (model, prompt_hash, note, is_full)"
+            " VALUES (%s, %s, %s, %s) RETURNING id",
+            (model, prompt_hash, note, full),
+        ).fetchone()[0]
+        if full:
+            connection.execute(
+                """
+                INSERT INTO extraction_run_scope (run_id, arxiv_id)
+                SELECT %(run)s, p.arxiv_id FROM paper p
+                 WHERE p.first_version_date >= %(start)s
+                   AND p.arxiv_id ~ %(shape)s
+                   AND EXISTS (SELECT 1 FROM paper_category c
+                                WHERE c.arxiv_id = p.arxiv_id AND c.category = ANY(%(slices)s))
+                """,
+                {
+                    "run": run_id,
+                    "start": HISTORY_START,
+                    "shape": f"^{_ARXIV_ID.pattern}$",
+                    "slices": list(CATEGORIES),
+                },
+            )
     return run_id
 
 
@@ -113,7 +150,23 @@ def _usd(model: str, input_tokens: int, output_tokens: int) -> Decimal:
     return (Decimal(input_tokens) * price_in + Decimal(output_tokens) * price_out) / 1_000_000
 
 
-def _require_idle(connection: psycopg.Connection) -> None:
+# The papers a run has given up on, with the hash of the abstract the attempts were made on:
+# those with EXTRACTION_MAX_ATTEMPTS paid, unusable answers ('invalid') or API rejections
+# ('errored') to the abstract they have now. Expired and canceled requests do not count.
+# One grouped pass over the run's batches. _due and runs.py both use it, so a paper the
+# full run stops waiting for is also one the daily job stops paying for.
+GIVEN_UP_SQL = """
+    SELECT bp.arxiv_id, bp.abstract_hash
+      FROM extraction_batch b
+      JOIN extraction_batch_paper bp ON bp.batch_id = b.id
+      JOIN paper p ON p.arxiv_id = bp.arxiv_id AND p.abstract_hash = bp.abstract_hash
+     WHERE b.run_id = %(run)s AND b.status = 'collected' AND bp.outcome IN ('invalid', 'errored')
+     GROUP BY bp.arxiv_id, bp.abstract_hash
+    HAVING count(*) >= %(attempts)s
+"""
+
+
+def require_idle(connection: psycopg.Connection) -> None:
     # Both steps roll their own work back on failure; with the caller's transaction open
     # that would take the caller's work with it.
     if connection.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
@@ -153,7 +206,7 @@ def submit(
     row, counted in the budget, instead of a paid batch nobody knows about. Only a refusal
     that certainly created nothing (BatchRejected) takes the money back and frees the papers.
     """
-    _require_idle(connection)
+    require_idle(connection)
     arxiv_ids = _supported(arxiv_ids)
     if not arxiv_ids:
         return None
@@ -265,8 +318,13 @@ def _due(
               FROM extraction_batch_paper bp JOIN extraction_batch b ON b.id = bp.batch_id
              WHERE b.run_id = %(run)s AND b.status IN ('sending', 'submitted')
                AND bp.arxiv_id = ANY(%(ids)s)
+            UNION
+            SELECT g.arxiv_id, g.abstract_hash FROM ("""
+            + GIVEN_UP_SQL
+            + """) g
+             WHERE g.arxiv_id = ANY(%(ids)s)
             """,
-            {"run": run_id, "ids": ids},
+            {"run": run_id, "ids": ids, "attempts": EXTRACTION_MAX_ATTEMPTS},
         ).fetchall()
     )
     return [stored[i] for i in ids if (i, stored[i][1]) not in taken]
@@ -288,7 +346,7 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
     The network is read first, with no transaction and no lock; the database is written in
     one short transaction after, so a slow download holds nothing.
     """
-    _require_idle(connection)
+    require_idle(connection)
     with connection.transaction():
         row = connection.execute(
             "SELECT status, provider_batch_id,"
@@ -347,6 +405,7 @@ def _store_batch(
     )
     counter: Counter = Counter()
     seen: set[str] = set()
+    outcomes: list[tuple[str, int, str]] = []
     input_tokens = output_tokens = 0
     for result in results:
         # Every answer is billed, whatever becomes of it.
@@ -357,13 +416,25 @@ def _store_batch(
         seen.add(result.arxiv_id)
         if result.mentions is None:
             counter["failed"] += 1
+            # Only a paid answer not in the schema ("invalid") and a request the API
+            # rejects ("errored") count toward giving up; expired and canceled ones say
+            # nothing about the paper.
+            outcome = result.unanswered or "invalid"
         elif current.get(result.arxiv_id) != sent[result.arxiv_id]:
             # The abstract changed after the send; a batch sent for the newer one may be
             # stored already, and this answer must not replace it.
             counter["stale"] += 1
+            outcome = "stale"
         else:
             counter["extracted"] += 1
             counter["mentions"] += _store(connection, run_id, sent[result.arxiv_id], result)
+            outcome = "extracted"
+        outcomes.append((outcome, batch_id, result.arxiv_id))
+    with connection.cursor() as cursor:
+        cursor.executemany(
+            "UPDATE extraction_batch_paper SET outcome = %s WHERE batch_id = %s AND arxiv_id = %s",
+            outcomes,
+        )
     connection.execute(
         """
         UPDATE extraction_batch
@@ -460,7 +531,9 @@ def result_from_batch_entry(entry: Any) -> ExtractionResult:
     out, it would make the whole batch look cut off.
     """
     if entry.result.type != "succeeded":
-        return ExtractionResult(entry.custom_id.replace("_", "."), None, 0, 0)
+        return ExtractionResult(
+            entry.custom_id.replace("_", "."), None, 0, 0, unanswered=entry.result.type
+        )
     message = entry.result.message
     text = next((block.text for block in message.content if block.type == "text"), None)
     try:
