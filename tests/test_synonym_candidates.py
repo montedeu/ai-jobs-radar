@@ -384,13 +384,13 @@ def test_abbreviation_sharing_an_expansion_with_a_conflict_is_not_a_candidate(da
     }
 
 
-def test_pair_whose_key_is_not_a_normal_form_goes_to_conflicts(database_url):
-    # normal_form("Low-Rank Adaptation.-.") is "low rank adaptation.", which read_synonyms
-    # rejects as a key because its own normal form drops the full stop.
-    candidates = collect(database_url, ["Low-Rank Adaptation.-. (LoRA)"])
+def test_pair_with_trailing_punctuation_gives_keys_the_dictionary_accepts(database_url, tmp_path):
+    candidates, merged = transfer(database_url, tmp_path, [], ["Low-Rank Adaptation.-. (LoRA)"])
 
-    assert candidates.pairs == {}
-    assert candidates.conflicts == {"lora": {"Low-Rank Adaptation.-.": 1}}
+    assert "lora" in candidates.pairs
+    assert candidates.conflicts == {}
+    assert all(key == normal_form(key) for key in merged)
+    assert {"lora", "low rank adaptation"} <= set(merged)
 
 
 def test_dictionary_expansion_against_another_one_in_the_corpus_is_a_conflict(database_url):
