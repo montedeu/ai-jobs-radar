@@ -29,7 +29,7 @@ def add_paper(connection, arxiv_id, *, categories=("cs.CL",), first_version_date
 
 
 def new_run(connection, *, full=True):
-    return start_run(connection, model=EXTRACTION_MODEL, prompt_hash="stub", full=full)
+    return start_run(connection, model=EXTRACTION_MODEL, full=full)
 
 
 def mark_done(connection, run_id, *arxiv_ids):
@@ -83,7 +83,7 @@ def test_no_current_run_before_any_promotion(connection, papers):
 def test_start_run_records_whether_the_run_is_full(connection):
     full = new_run(connection)
     pilot = new_run(connection, full=False)
-    default = start_run(connection, model=EXTRACTION_MODEL, prompt_hash="x")
+    default = start_run(connection, model=EXTRACTION_MODEL)
     rows = connection.execute("SELECT id, is_full FROM extraction_run ORDER BY id").fetchall()
     assert rows == [(full, True), (pilot, False), (default, False)]
 

@@ -27,6 +27,11 @@ BATCH_PRICES_USD_PER_MTOK = {
 # uses all of it: a batch is never allowed to cost more than the estimate said.
 EXTRACTION_MAX_OUTPUT_TOKENS = 2048
 
+# Models that reason when the request says nothing about it (claude-api skill, Haiku 5.5:
+# adaptive thinking on by default). A run with reasoning sends no thinking parameter, so it
+# is allowed only for these; for any other model what that request does is not known.
+REASONING_BY_DEFAULT_MODELS = frozenset({"claude-haiku-5-5"})
+
 # How many answers of the run to the paper's current abstract may be unusable (paid for but
 # not in the schema, or a request the API rejects as errored) before the run gives up on
 # the paper: it is not sent again in that run, and a full run does not wait for it to become
