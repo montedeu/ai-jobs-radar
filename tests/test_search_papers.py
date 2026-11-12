@@ -296,3 +296,38 @@ def test_tool_does_not_touch_arxiv(client, world):
 def test_search_without_token_is_rejected(client, world):
     response = call(client, "tools/call", {"name": "search_papers", "arguments": {}}, token=None)
     assert response.status_code == 401
+
+
+def test_as_of_bounds_the_papers_and_the_processed_history(client, world):
+    answer = found(client, as_of="2025-11-05")
+
+    assert ids(answer) == ["2511.00001"]
+    assert answer["header"]["as_of"] == "2025-11-05"
+    assert answer["header"]["processed_through"] <= "2025-11-05"
+
+
+def test_as_of_and_date_to_the_earlier_one_wins(client, world):
+    assert ids(found(client, as_of="2025-11-20", date_to="2025-11-05")) == ["2511.00001"]
+    assert ids(found(client, as_of="2025-11-05", date_to="2025-11-20")) == ["2511.00001"]
+
+
+def test_processed_through_is_none_when_the_first_paper_of_the_history_is_missing(
+    client, connection, world
+):
+    add_paper(connection, "2511.00007", "First day", "First.", "2025-11-01")
+
+    assert found(client)["header"]["processed_through"] is None
+
+
+def test_a_paper_whose_abstract_changed_is_not_processed(client, connection, world):
+    connection.execute("UPDATE paper SET abstract_hash = 'new' WHERE arxiv_id = '2511.00002'")
+
+    assert found(client)["header"]["processed_through"] == "2025-11-09"
+
+
+@pytest.mark.parametrize("entity", ["   ", "", "...", ",;:"])
+def test_an_entity_without_a_spelling_is_an_error(client, world, entity):
+    result = search_tool(client, entity=entity)
+
+    assert result["isError"]
+    assert "entity" in result["content"][0]["text"]

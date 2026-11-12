@@ -103,6 +103,7 @@ def search_papers(
     date_from: date | None = None,
     date_to: date | None = None,
     limit: int = 20,
+    as_of: date | None = None,
 ) -> SearchResult:
     """Find papers by the text of the title and abstract, by an entity, by slice and by dates.
 
@@ -110,7 +111,9 @@ def search_papers(
     entity in any spelling, matched against the mentions the current extraction run found
     (any type). Both can be given. `category` is the slice (collected: cs.CL); `date_from`
     and `date_to` bound the paper's date (first version), both ends included. `limit` is 1
-    to 100. Papers come best text match first, then newest first.
+    to 100. `as_of` is the day of calculation (default: yesterday, UTC); papers dated after it
+    are left out and the processed history ends no later. Papers come best text match first,
+    then newest first.
 
     Each paper has its arXiv id, title, date and link. The answer starts with a header: the
     date of calculation, the extraction run, the processed history's end, the dictionary's
@@ -130,6 +133,7 @@ def search_papers(
                 date_from=date_from,
                 date_to=date_to,
                 limit=limit,
+                as_of=as_of,
             )
     except BadRequest as error:
         # The framework shows a client only a ToolError's text.

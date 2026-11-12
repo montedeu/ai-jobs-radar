@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from research_radar.extraction import GIVEN_UP_SQL, SCOPE_PARAMS, SCOPE_SQL
 from research_radar.history_summary import slice_collected_through
 from research_radar.runs import current_run
-from research_radar.settings import CATEGORIES, EXTRACTION_MAX_ATTEMPTS
+from research_radar.settings import CATEGORIES, EXTRACTION_MAX_ATTEMPTS, HISTORY_START
 from research_radar.synonyms import current_dictionary
 
 # CLAUDE.md, "Что сервис оговаривает в ответах".
@@ -21,7 +21,8 @@ NOTES = [
 ]
 
 # Over the papers of the collected slices since HISTORY_START: the earliest one the run has
-# neither finished nor given up on, and the latest one it has finished.
+# neither finished nor given up on, and the latest one it has finished. A paper whose
+# abstract changed since its extraction is not finished (as in daily_extraction._DUE_SQL).
 _BOUNDS = (
     """
     SELECT min(p.first_version_date) FILTER (WHERE e.arxiv_id IS NULL AND g.arxiv_id IS NULL),
@@ -31,6 +32,7 @@ _BOUNDS = (
     + """) s
       JOIN paper p ON p.arxiv_id = s.arxiv_id
       LEFT JOIN paper_extraction e ON e.run_id = %(run)s AND e.arxiv_id = s.arxiv_id
+                             AND e.abstract_hash = p.abstract_hash
       LEFT JOIN ("""
     + GIVEN_UP_SQL
     + """) g ON g.arxiv_id = s.arxiv_id
@@ -49,23 +51,25 @@ class ResponseHeader(BaseModel):
 
 def response_header(connection: psycopg.Connection, *, as_of: date | None = None) -> ResponseHeader:
     run = current_run(connection)
+    as_of_day = as_of or datetime.now(UTC).date() - timedelta(days=1)
     dictionary = current_dictionary(connection)
     return ResponseHeader(
-        as_of=as_of or datetime.now(UTC).date() - timedelta(days=1),
+        as_of=as_of_day,
         extraction_run=run,
-        processed_through=None if run is None else _processed_through(connection, run),
+        processed_through=None if run is None else _processed_through(connection, run, as_of_day),
         dictionary_updated_at=dictionary.loaded_at if dictionary else None,
         dictionary_sha256=dictionary.file_sha256 if dictionary else None,
         notes=list(NOTES),
     )
 
 
-def _processed_through(connection: psycopg.Connection, run: int) -> date | None:
+def _processed_through(connection: psycopg.Connection, run: int, as_of: date) -> date | None:
     """The last day D such that the run has finished every paper of the collected slices
     dated up to D, leaving out the papers it gave up on (ADR 0004).
 
     Never past the collected history: a paper that is not stored yet is not finished
-    either, so a slice added before its backfill would otherwise claim days it lacks.
+    either, so a slice added before its backfill would otherwise claim days it lacks. Nor
+    past as_of. None when the history's first day is not finished: nothing is processed.
     """
     collected = [slice_collected_through(connection, category) for category in CATEGORIES]
     if None in collected:
@@ -74,4 +78,7 @@ def _processed_through(connection: psycopg.Connection, run: int) -> date | None:
         _BOUNDS, {**SCOPE_PARAMS, "run": run, "attempts": EXTRACTION_MAX_ATTEMPTS}
     ).fetchone()
     through = first_missing - timedelta(days=1) if first_missing else last_finished
-    return min(through, *collected) if through else None
+    if through is None:
+        return None
+    through = min(through, as_of, *collected)
+    return through if through >= HISTORY_START else None
