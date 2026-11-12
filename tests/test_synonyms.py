@@ -77,8 +77,19 @@ def test_plural_s_after_a_digit_is_dropped():
     assert normal_form("Llama2s") == "llama2"
 
 
+def test_short_or_numeric_words_keep_their_s():
+    assert normal_form("4s") == "4s"
+    assert normal_form("A1s") == "a1s"
+    assert normal_form("1990s") == "1990s"
+    assert normal_form("100s") == "100s"
+
+
 def test_leading_full_stop_is_kept():
     assert normal_form(".NET") == ".net"
+
+
+def test_leading_colon_and_space_are_stripped():
+    assert normal_form(": BERT") == "bert"
 
 
 def test_normal_form_keeps_words_that_only_look_plural():
@@ -103,8 +114,11 @@ def test_normal_form_is_idempotent_on_examples():
 def test_normal_form_is_idempotent_on_random_text():
     rng = random.Random(20261113)
     alphabet = "abcAB s-.,;:–\t 0123456789  "
-    for _ in range(2000):
-        spelling = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
+    for i in range(2000):
+        # Every third spelling starts with a full stop: the leading dot is kept, so it must be
+        # idempotent too.
+        lead = "." if i % 3 == 0 else ""
+        spelling = lead + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
         assert normal_form(normal_form(spelling)) == normal_form(spelling), spelling
 
 
