@@ -266,9 +266,21 @@ def test_candidate_rows_use_the_existing_name_for_both_keys(tmp_path):
 
     assert read_rows(path) == [
         HEADER,
-        ["lora", "LoRA", "2"],
         ["low rank adaptation", "LoRA", "2"],
     ]
+
+
+def test_candidate_rows_skip_a_key_the_dictionary_has_and_keep_the_other(tmp_path):
+    candidates = Candidates(
+        pairs={"lora": ("Low-Rank Adaptation", 2)},
+        conflicts={},
+        existing_names={"low rank adaptation": "Low-Rank Adaptation"},
+    )
+    path = tmp_path / "candidates.csv"
+
+    write_candidates_csv(candidates, path)
+
+    assert read_rows(path) == [HEADER, ["lora", "Low-Rank Adaptation", "2"]]
 
 
 def test_candidate_takes_the_existing_name_of_the_expansion(database_url):
@@ -276,7 +288,7 @@ def test_candidate_takes_the_existing_name_of_the_expansion(database_url):
 
     candidates = collect(database_url, [LORA_FULL], synonyms=synonyms)
 
-    assert candidates.existing_names == {"lora": "Low-Rank Adaptation"}
+    assert candidates.existing_names == {"low rank adaptation": "Low-Rank Adaptation"}
 
 
 def test_conflict_counts_pairs_the_dictionary_covers(database_url):

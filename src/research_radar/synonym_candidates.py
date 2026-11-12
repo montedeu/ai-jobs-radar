@@ -43,8 +43,9 @@ class Candidates:
     pairs: dict[str, tuple[str, int]]
     # abbreviation with two or more expansions -> {expansion: number of papers}
     conflicts: dict[str, dict[str, int]]
-    # abbreviation -> canonical name the dictionary already has for it or its expansion; a
-    # candidate row takes that name instead of renaming the existing entity
+    # normal form of a pair's side -> its canonical name, for the sides the dictionary already
+    # has: the other row takes that name instead of renaming the entity, and the side that is
+    # there is not written again (``read_synonyms`` refuses a repeated key)
     existing_names: dict[str, str] = field(default_factory=dict)
 
 
@@ -199,8 +200,7 @@ def collect_candidates(connection: psycopg.Connection) -> Candidates:
             ((expansion, papers),) = counted.items()
             pairs[key] = (expansion, papers)
             (expansion_key,) = expansions
-            if name := known.get(key) or known.get(expansion_key):
-                existing_names[key] = name
+            existing_names.update({k: known[k] for k in (key, expansion_key) if k in known})
     return Candidates(
         pairs=dict(sorted(pairs.items(), key=lambda item: (-item[1][1], item[0]))),
         conflicts=dict(sorted(conflicts.items())),
@@ -242,9 +242,11 @@ def write_candidates_csv(candidates: Candidates, path: Path) -> None:
         expansion_key = normal_form(name)
         new = expansion_key not in named
         canonical = named.setdefault(expansion_key, name)
-        canonical = candidates.existing_names.get(key, canonical)
-        pair_rows.append((key, canonical, papers))
-        if new:
+        existing = candidates.existing_names
+        canonical = existing.get(key) or existing.get(expansion_key) or canonical
+        if key not in existing:
+            pair_rows.append((key, canonical, papers))
+        if new and expansion_key not in existing:
             pair_rows.append((expansion_key, canonical, papers))
     conflict_rows = [
         (key, name, papers)
