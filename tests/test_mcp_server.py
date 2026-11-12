@@ -5,7 +5,7 @@ import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from research_radar import collect, mcp_server
+from research_radar import collect, history_summary, mcp_server
 from research_radar.database import connect
 
 TOKEN = "test-token"
@@ -292,3 +292,16 @@ def test_failed_history_summary_does_not_hide_the_latest_runs(
     assert [run["job"] for run in result["latest_runs"]] == ["collect"]
     assert result["history"] is None
     assert result["history_error"] == "OperationalError: connection lost"
+
+
+def test_query_failing_inside_the_snapshot_reports_its_own_error(client, database_url, monkeypatch):
+    def failing_query(connection, category):
+        connection.execute("SELECT 1 / 0")
+
+    monkeypatch.setattr(history_summary, "_slice_history", failing_query)
+
+    response = call(client, "tools/call", {"name": "service_status", "arguments": {}})
+
+    result = response.json()["result"]["structuredContent"]
+    assert result["history"] is None
+    assert result["history_error"].startswith("DivisionByZero:")

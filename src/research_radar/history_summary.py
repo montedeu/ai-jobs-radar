@@ -48,6 +48,10 @@ def history_summary(connection: psycopg.Connection) -> HistorySummary:
         size = connection.execute("SELECT pg_database_size(current_database())").fetchone()[0]
         connection.commit()
     finally:
+        # After an error the transaction is still open and the settings cannot change in
+        # it; the rollback keeps the caller seeing the original error. After a commit it
+        # does nothing.
+        connection.rollback()
         connection.isolation_level = None
         connection.read_only = None
     return HistorySummary(
