@@ -12,11 +12,10 @@ from typing import Any
 
 import psycopg
 
-from research_radar import extraction, runs
+from research_radar import extraction, runs, settings
 from research_radar.database import connect, database_url, direct_url, require_direct
 from research_radar.job_log import RunSkipped, record_run
 from research_radar.settings import (
-    EXTRACTION_BATCH_SIZE,
     EXTRACTION_DAILY_MAX_PAPERS,
     EXTRACTION_MAX_ATTEMPTS,
 )
@@ -77,8 +76,18 @@ class _LazyClient:
             self._client = self._factory()
         return self._client
 
-    def __getattr__(self, name: str):
-        return getattr(self.resolve(), name)
+    # The four methods of ModelClient, spelled out: a change of the protocol shows up here.
+    def count_tokens(self, requests, *, model, config):
+        return self.resolve().count_tokens(requests, model=model, config=config)
+
+    def submit_batch(self, requests, *, model, config):
+        return self.resolve().submit_batch(requests, model=model, config=config)
+
+    def batch_ended(self, batch_id):
+        return self.resolve().batch_ended(batch_id)
+
+    def batch_results(self, batch_id):
+        return self.resolve().batch_results(batch_id)
 
 
 def _collect_all(
@@ -111,7 +120,8 @@ def _collect_all(
 def _submit_all(
     connection: psycopg.Connection, client: _LazyClient, run_id: int, due: list[str], details: dict
 ) -> None:
-    parts = [due[i : i + EXTRACTION_BATCH_SIZE] for i in range(0, len(due), EXTRACTION_BATCH_SIZE)]
+    size = settings.EXTRACTION_BATCH_SIZE
+    parts = [due[i : i + size] for i in range(0, len(due), size)]
     for index, part in enumerate(parts):
         try:
             batch_id = extraction.submit(connection, client, run_id, part)
@@ -168,7 +178,11 @@ def extract_daily(
                 client.resolve()
                 _submit_all(connection, client, run_id, due, details)
     finally:
-        details["spent_usd"] = str(extraction.spent_usd(connection))
+        try:
+            details["spent_usd"] = str(extraction.spent_usd(connection))
+        except psycopg.Error:
+            # Reading the total must not replace the error that is already on its way out.
+            details["spent_usd"] = None
     if details["batch_errors"]:
         raise RuntimeError(f"batches not collected: {details['batch_errors']}")
     return details

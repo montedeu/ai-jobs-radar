@@ -97,7 +97,8 @@ jobs:
       # failed run is recorded in the job run log and the next scheduled run picks up from
       # the last success; a blind retry would only repeat the same requests to arXiv and
       # to the API. --task-timeout 60m is for the one-off backfill (--args=backfill, about
-      # 20 minutes per year of history); a daily run takes seconds.
+      # 20 minutes per year of history); a daily run collects in seconds, but counting
+      # tokens and sending a batch can take minutes.
       - name: Deploy the collect job
         run: |
           gcloud run jobs deploy "$COLLECT_JOB" \

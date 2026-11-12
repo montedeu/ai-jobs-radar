@@ -2,7 +2,7 @@ import psycopg
 import pytest
 from fakes import FakeModel
 
-from research_radar import cli, collect, daily_extraction, extraction, runs
+from research_radar import cli, collect, daily_extraction, extraction, runs, settings
 from research_radar.daily_extraction import TooManyPapers, extract_daily
 from research_radar.extraction import (
     BudgetExceeded,
@@ -423,6 +423,7 @@ def test_a_broken_batch_does_not_stop_the_others_or_the_switch(connection, curre
         ("2511.00004", "full"),
     ):
         mark_done(connection, full, arxiv_id, abstract)
+    add_paper(connection, "2511.00005", "later")  # not in the full run's scope
     details = {}
 
     with pytest.raises(RuntimeError, match="not collected"):
@@ -432,12 +433,14 @@ def test_a_broken_batch_does_not_stop_the_others_or_the_switch(connection, curre
     assert "results expired" in details["batch_errors"][str(broken)]
     assert details["batches_collected"] == 1
     assert details["promoted"] == full
-    # The papers were still sent, after the switch, to the new current run.
+    # The paper was still sent, after the switch, to the new current run.
     assert details["current_run"] == full
+    assert details["submitted"] == 1
+    assert model.calls.count("submit_batch") == 3
 
 
 def test_due_papers_go_in_parts_of_the_batch_size(connection, current, monkeypatch):
-    monkeypatch.setattr(daily_extraction, "EXTRACTION_BATCH_SIZE", 1)
+    monkeypatch.setattr(settings, "EXTRACTION_BATCH_SIZE", 1)
     model = FakeModel()
 
     details = extract_daily(connection, factory(model))
@@ -450,7 +453,7 @@ def test_due_papers_go_in_parts_of_the_batch_size(connection, current, monkeypat
 def test_budget_after_a_sent_part_stops_sending_and_says_how_much_is_left(
     connection, current, monkeypatch
 ):
-    monkeypatch.setattr(daily_extraction, "EXTRACTION_BATCH_SIZE", 1)
+    monkeypatch.setattr(settings, "EXTRACTION_BATCH_SIZE", 1)
     real = extraction.submit
     calls = []
 
@@ -467,3 +470,25 @@ def test_budget_after_a_sent_part_stops_sending_and_says_how_much_is_left(
         extract_daily(connection, factory(FakeModel()), details=details)
 
     assert details["submitted"] == 1
+
+
+def test_without_a_key_a_waiting_batch_skips_the_step_and_the_command_exits_cleanly(
+    database_url, connection, current, fake_arxiv, monkeypatch
+):
+    # Nothing is due: the only way to the model is collecting the waiting batch.
+    connection.execute(
+        "UPDATE paper_extraction SET abstract_hash = %s WHERE arxiv_id = '2511.00002'",
+        (abstract_hash("now"),),
+    )
+    extraction.submit(connection, FakeModel(ended=False), current, ["2511.00003"])
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.setattr(collect, "ArxivClient", lambda: fake_arxiv)
+
+    cli.main(["daily"])
+
+    assert [(r[0], r[1]) for r in job_rows(connection)] == [
+        ("collect", "succeeded"),
+        ("extract", "skipped"),
+    ]
+    assert "#22" in job_rows(connection)[1][2]["skipped"]
