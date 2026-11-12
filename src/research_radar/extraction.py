@@ -5,6 +5,7 @@ the process that sent it may be gone by then. Everything the second step needs i
 database. The model is reached only through ModelClient; tests pass a fake one.
 """
 
+import logging
 import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
@@ -24,12 +25,21 @@ from research_radar.settings import (
     EXTRACTION_MAX_OUTPUT_TOKENS,
 )
 
+log = logging.getLogger(__name__)
+
 # A placeholder: the wording and the stop-list are written in #6 and #7.
 EXTRACTION_PROMPT = (
     "List the methods, models, tasks and datasets that the abstract mentions. "
     "Copy each spelling exactly as written. If the abstract spells out an abbreviation, "
     "give the full form as its expansion."
 )
+
+
+# The Batches API takes a custom_id of letters, digits, underscore and hyphen, up to 64
+# characters; an arXiv id has a dot. A new-style id has nothing else, so the swap is
+# reversible. An id of another shape (an old "hep-th/9901001") cannot be sent; submit
+# leaves such papers out.
+_ARXIV_ID = re.compile(r"[0-9]{4}\.[0-9]{4,5}")
 
 
 def prompt_hash() -> str:
@@ -73,6 +83,10 @@ class ModelClient(Protocol):
     def batch_ended(self, batch_id: str) -> bool: ...
 
     def batch_results(self, batch_id: str) -> Iterator[ExtractionResult]: ...
+
+
+# How many times submit counts tokens when abstracts change under it, before it gives up.
+MAX_COUNTS = 2
 
 
 class BudgetExceeded(Exception):
@@ -128,13 +142,15 @@ def submit(
     Title and abstract are read from the database here, so the hash recorded for what was
     sent is always the hash of what was sent. Returns None when there is nothing to send.
     Raises BudgetExceeded, before anything is sent, when the batch's most expensive outcome
-    plus what is spent passes the ceiling.
+    plus what is spent passes the ceiling. Ids of a shape that cannot be sent (see
+    _ARXIV_ID) are left out of the batch and logged as a warning.
 
     The batch is recorded as 'sending' before it is sent: a failure after that leaves the
     row, counted in the budget, instead of a paid batch nobody knows about. Only a refusal
     that certainly created nothing (BatchRejected) takes the money back and frees the papers.
     """
     _require_idle(connection)
+    arxiv_ids = _supported(arxiv_ids)
     if not arxiv_ids:
         return None
     with connection.transaction():
@@ -142,34 +158,42 @@ def submit(
         todo = _due(connection, run_id, arxiv_ids)
     if not todo:
         return None
-    # Counting is slow network work and takes no money; it stays outside the lock below.
-    input_tokens = client.count_tokens([request for request, _ in todo], model=model)
-    # The output is counted at the cap for every paper: the real size is not known before.
-    estimate = _usd(model, input_tokens, len(todo) * EXTRACTION_MAX_OUTPUT_TOKENS)
-    with connection.transaction():
-        # Two submits at once would each see the same spent money and both pass the ceiling.
-        connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
-        # Another submit may have taken some of the papers while this one was counting, and
-        # an abstract may have changed. The estimate then covers more than is sent, or a
-        # slightly different text: the safe side, an abstract's size hardly moves it.
-        todo = _due(connection, run_id, [request.arxiv_id for request, _ in todo])
-        if not todo:
-            return None
-        if spent_usd(connection) + estimate > ceiling_usd:
-            raise BudgetExceeded(
-                f"batch estimated at ${estimate} does not fit under ${ceiling_usd}"
-            )
-        batch_id = connection.execute(
-            "INSERT INTO extraction_batch (run_id, estimated_cost_usd) VALUES (%s, %s)"
-            " RETURNING id",
-            (run_id, estimate),
-        ).fetchone()[0]
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash)"
-                " VALUES (%s, %s, %s)",
-                [(batch_id, request.arxiv_id, abstract) for request, abstract in todo],
-            )
+    for _attempt in range(MAX_COUNTS):
+        # Counting is slow network work and takes no money; it stays outside the lock below.
+        input_tokens = client.count_tokens([request for request, _ in todo], model=model)
+        # The output is counted at the cap for every paper: the real size is not known before.
+        estimate = _usd(model, input_tokens, len(todo) * EXTRACTION_MAX_OUTPUT_TOKENS)
+        with connection.transaction():
+            # Two submits at once would each see the same spent money and both pass the ceiling.
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext('extraction_budget'))")
+            counted = {request.arxiv_id: abstract for request, abstract in todo}
+            # Another submit may have taken some of the papers while this one was counting;
+            # then the estimate covers more than is sent, the safe side.
+            todo = _due(connection, run_id, list(counted))
+            if not todo:
+                return None
+            if any(counted[request.arxiv_id] != abstract for request, abstract in todo):
+                # An abstract changed since the count, so the estimate is of another text.
+                # Leaving the block frees the lock before the slow count is done again.
+                continue
+            if spent_usd(connection) + estimate > ceiling_usd:
+                raise BudgetExceeded(
+                    f"batch estimated at ${estimate} does not fit under ${ceiling_usd}"
+                )
+            batch_id = connection.execute(
+                "INSERT INTO extraction_batch (run_id, estimated_cost_usd) VALUES (%s, %s)"
+                " RETURNING id",
+                (run_id, estimate),
+            ).fetchone()[0]
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash)"
+                    " VALUES (%s, %s, %s)",
+                    [(batch_id, request.arxiv_id, abstract) for request, abstract in todo],
+                )
+            break
+    else:
+        raise RuntimeError(f"abstracts changed during each of {MAX_COUNTS} counts; try again")
     try:
         provider_batch_id = client.submit_batch([request for request, _ in todo], model=model)
     except BatchRejected:
@@ -185,6 +209,15 @@ def submit(
             (provider_batch_id, batch_id),
         )
     return batch_id
+
+
+def _supported(arxiv_ids: Sequence[str]) -> list[str]:
+    """The ids of a shape that can be sent; the others are left out and logged."""
+    unique = list(dict.fromkeys(arxiv_ids))
+    unsupported = [i for i in unique if not _ARXIV_ID.fullmatch(i)]
+    if unsupported:
+        log.warning("not sent, arXiv id of an unsupported shape: %s", ", ".join(unsupported))
+    return [i for i in unique if i not in unsupported]
 
 
 def _run_model(connection: psycopg.Connection, run_id: int) -> str:
@@ -238,9 +271,11 @@ def collect(connection: psycopg.Connection, client: ModelClient, batch_id: int) 
 
     Counts "extracted", "mentions", "pending" (not ended yet), "unsent" (stuck in
     'sending', for a person to sort out), "rejected", "failed" (no usable answer: the paper
-    gets no completion mark) and "stale" (the paper's abstract changed since the batch was
-    sent, so the answer is dropped and the paper stays due). A batch already collected is
-    left alone, so running this again after a crash is safe.
+    gets no completion mark), "incomplete" (the batch ended with fewer results than papers;
+    nothing is stored and the batch stays 'submitted', so the next call tries again) and
+    "stale" (the paper's abstract changed since the batch was sent, so the answer is dropped
+    and the paper stays due). A batch already collected is left alone, so running this
+    again after a crash is safe.
 
     The network is read first, with no transaction and no lock; the database is written in
     one short transaction after, so a slow download holds nothing.
@@ -296,6 +331,11 @@ def _store_batch(
             (list(sent),),
         ).fetchall()
     )
+    answered = {result.arxiv_id for result in results} & set(sent)
+    if len(answered) < len(sent):
+        # The Batches API gives a line for every request, so a short stream is a download
+        # that broke off. Storing part of it would mark the batch done and lose the rest.
+        return Counter(incomplete=len(sent) - len(answered))
     counter: Counter = Counter()
     seen: set[str] = set()
     input_tokens = output_tokens = 0
@@ -315,8 +355,6 @@ def _store_batch(
         else:
             counter["extracted"] += 1
             counter["mentions"] += _store(connection, run_id, sent[result.arxiv_id], result)
-    if missing := len(sent) - len(seen):
-        counter["failed"] += missing
     connection.execute(
         """
         UPDATE extraction_batch
@@ -396,10 +434,7 @@ def _request_text(request: ExtractionRequest) -> str:
     return f"Title: {request.title}\n\nAbstract: {request.abstract}"
 
 
-# The Batches API takes a custom_id of letters, digits, underscore and hyphen, up to 64
-# characters; an arXiv id has a dot. A new-style id has nothing else, so the swap is
-# reversible; an id of another shape (an old "hep-th/9901001") cannot be sent.
-_ARXIV_ID = re.compile(r"[0-9]{4}\.[0-9]{4,5}")
+_REFUSED_BEFORE_CREATING = frozenset({400, 401, 403, 404, 409, 413, 422, 429})
 
 
 def _custom_id(arxiv_id: str) -> str:
@@ -493,15 +528,14 @@ class AnthropicModelClient:
                 .messages.batches.create(requests=entries)
                 .id
             )
-        except (
-            anthropic.BadRequestError,
-            anthropic.AuthenticationError,
-            anthropic.PermissionDeniedError,
-            anthropic.NotFoundError,
-        ) as error:
-            # A 4xx came back before any batch was made. A timeout, a dropped connection
-            # or a 5xx is not told apart from a batch that was made, so it is not caught.
-            raise BatchRejected(str(error)) from error
+        except anthropic.APIStatusError as error:
+            # These statuses came back before any batch was made. A timeout, a dropped
+            # connection or a 5xx cannot be told from a batch that was made, so those are
+            # not caught. A 429 is caught: without it a full run's estimate would stay
+            # reserved as 'sending' for good.
+            if error.status_code in _REFUSED_BEFORE_CREATING:
+                raise BatchRejected(str(error)) from error
+            raise
 
     def batch_ended(self, batch_id: str) -> bool:
         return self._client.messages.batches.retrieve(batch_id).processing_status == "ended"

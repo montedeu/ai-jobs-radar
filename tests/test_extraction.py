@@ -344,10 +344,17 @@ def test_answer_not_matching_the_schema_gets_no_mark_and_others_are_kept(connect
     assert spent_usd(connection) == usd(210, 45)
 
 
-def test_paper_missing_from_results_is_counted_failed(connection):
+def test_batch_with_fewer_results_than_papers_is_not_stored_and_not_marked_collected(connection):
     add_papers(connection, LORA, SURVEY)
-    _, counter = run_batch(connection, FakeModel(SURVEY_ANSWER), new_run(connection), LORA, SURVEY)
-    assert counter == Counter(extracted=1, failed=1)
+    model = FakeModel(SURVEY_ANSWER)  # the answer for LORA never arrives
+    batch_id, counter = run_batch(connection, model, new_run(connection), LORA, SURVEY)
+    assert counter == Counter(incomplete=1)
+    assert connection.execute("SELECT count(*) FROM paper_extraction").fetchone() == (0,)
+    assert connection.execute("SELECT status FROM extraction_batch").fetchone() == ("submitted",)
+    # The next collect tries again, and takes the whole batch once it is all there.
+    model.answers[LORA.arxiv_id] = LORA_ANSWER
+    assert collect(connection, model, batch_id) == Counter(extracted=2, mentions=4)
+    assert connection.execute("SELECT status FROM extraction_batch").fetchone() == ("collected",)
 
 
 def test_collecting_a_collected_batch_changes_nothing(connection):
@@ -804,19 +811,129 @@ def test_real_client_refuses_an_id_it_cannot_encode_before_calling_the_api():
     assert sdk.batches.created == []
 
 
+def sdk_error(name, status):
+    anthropic = pytest.importorskip("anthropic")
+    error = getattr(anthropic, name).__new__(getattr(anthropic, name))
+    error.status_code = status
+    return error
+
+
 @pytest.mark.parametrize(
-    "name", ["BadRequestError", "AuthenticationError", "PermissionDeniedError", "NotFoundError"]
+    "name, status",
+    [
+        ("BadRequestError", 400),
+        ("AuthenticationError", 401),
+        ("PermissionDeniedError", 403),
+        ("NotFoundError", 404),
+        ("ConflictError", 409),
+        ("RequestTooLargeError", 413),
+        ("UnprocessableEntityError", 422),
+        ("RateLimitError", 429),
+    ],
 )
-def test_real_client_turns_a_4xx_refusal_into_batch_rejected(name):
-    anthropic = pytest.importorskip("anthropic")
-    error = getattr(anthropic, name).__new__(getattr(anthropic, name))
+def test_real_client_turns_a_refusal_before_any_batch_was_made_into_batch_rejected(name, status):
     with pytest.raises(BatchRejected):
-        real_client(FakeSdkWithBatches(error)).submit_batch([LORA], model="m")
+        real_client(FakeSdkWithBatches(sdk_error(name, status))).submit_batch([LORA], model="m")
 
 
-@pytest.mark.parametrize("name", ["InternalServerError", "APIConnectionError", "APITimeoutError"])
-def test_real_client_lets_an_unclear_failure_through_unchanged(name):
-    anthropic = pytest.importorskip("anthropic")
-    error = getattr(anthropic, name).__new__(getattr(anthropic, name))
+@pytest.mark.parametrize(
+    "name, status",
+    [("InternalServerError", 500), ("APIConnectionError", None), ("APITimeoutError", None)],
+)
+def test_real_client_lets_an_unclear_failure_through_unchanged(name, status):
+    error = sdk_error(name, status)
     with pytest.raises(type(error)):
         real_client(FakeSdkWithBatches(error)).submit_batch([LORA], model="m")
+
+
+class EditsWhileCounting(FakeModel):
+    """Counts like the fake model, but an abstract changes while it counts."""
+
+    def __init__(self, connection, counts, *, edits=1):
+        super().__init__()
+        self.connection = connection
+        self.counts = list(counts)
+        self.edits = edits
+        self.counted_texts = []
+
+    def count_tokens(self, requests, *, model):
+        self.counted_texts.append([r.abstract for r in requests])
+        if self.edits:
+            self.edits -= 1
+            text = f"Edited abstract number {len(self.counted_texts)}."
+            self.connection.execute(
+                "UPDATE paper SET abstract = %s, abstract_hash = %s",
+                (text, abstract_hash(text)),
+            )
+        self.counted_tokens = self.counts.pop(0)
+        return super().count_tokens(requests, model=model)
+
+
+def test_abstract_changed_while_counting_is_counted_again_before_the_budget_check(connection):
+    add_papers(connection, LORA)
+    # The first count is small, the count of the new text is not: a budget check that kept
+    # the first one would let the batch through.
+    model = EditsWhileCounting(connection, [1000, 30_000_000])
+    with pytest.raises(BudgetExceeded):
+        submit(connection, model, new_run(connection), [LORA.arxiv_id], ceiling_usd=Decimal(1))
+    assert model.counted_texts == [[LORA.abstract], ["Edited abstract number 1."]]
+    assert "submit_batch" not in model.calls
+    assert advisory_locks(connection) == 0
+
+
+def test_the_batch_carries_the_text_that_was_counted_last(connection):
+    add_papers(connection, LORA)
+    model = EditsWhileCounting(connection, [1000, 1000])
+    submit(connection, model, new_run(connection), [LORA.arxiv_id])
+    assert [r.abstract for r in model.sent[0]] == ["Edited abstract number 1."]
+    assert model.counted_texts[-1] == ["Edited abstract number 1."]
+
+
+def test_abstracts_that_keep_changing_stop_after_two_counts(connection):
+    add_papers(connection, LORA)
+    model = EditsWhileCounting(connection, [1000, 1000, 1000], edits=5)
+    with pytest.raises(RuntimeError, match="changed"):
+        submit(connection, model, new_run(connection), [LORA.arxiv_id])
+    assert len(model.counted_texts) == 2
+    assert "submit_batch" not in model.calls
+    assert connection.execute("SELECT count(*) FROM extraction_batch").fetchone() == (0,)
+    assert advisory_locks(connection) == 0
+
+
+OLD_STYLE = "hep-th/9901001"
+
+
+def test_ids_of_an_unsupported_shape_are_skipped_and_reported_not_sent(connection, caplog):
+    add_papers(connection, LORA)
+    model = FakeModel()
+    with caplog.at_level("WARNING", logger="research_radar.extraction"):
+        batch_id = submit(connection, model, new_run(connection), [OLD_STYLE, LORA.arxiv_id])
+    assert batch_id is not None
+    assert [r.arxiv_id for r in model.sent[0]] == [LORA.arxiv_id]
+    assert OLD_STYLE in caplog.text
+    assert connection.execute("SELECT arxiv_id FROM extraction_batch_paper").fetchall() == [
+        (LORA.arxiv_id,)
+    ]
+
+
+def test_only_unsupported_ids_send_nothing(connection):
+    model = FakeModel()
+    assert submit(connection, model, new_run(connection), [OLD_STYLE]) is None
+    assert model.calls == []
+
+
+@pytest.mark.parametrize(
+    "client_class, arguments",
+    [
+        ("Anthropic", {}),
+        ("AsyncAnthropic", {}),
+        ("AnthropicBedrock", {"aws_region": "us-east-1"}),
+        ("AnthropicBedrockMantle", {"aws_region": "us-east-1"}),
+        ("AnthropicVertex", {"region": "us-east5", "project_id": "p"}),
+        ("AnthropicFoundry", {"api_key": "k", "resource": "r"}),
+    ],
+)
+def test_no_sdk_client_of_any_kind_can_be_built_in_a_test(client_class, arguments):
+    anthropic = pytest.importorskip("anthropic")
+    with pytest.raises(AssertionError, match="Anthropic API"):
+        getattr(anthropic, client_class)(**arguments)
