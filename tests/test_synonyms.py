@@ -35,6 +35,8 @@ NORMAL_FORM_EXAMPLES = [
     "Llama 3.1",
     "Low-Rank Adaptation.-.",
     "models.s",
+    "glasses.s",
+    "bosses.s",
     "GANs.",
     "LLMs,.",
     " -RAG- ",
@@ -90,7 +92,7 @@ def test_normal_form_is_idempotent_on_examples():
 
 def test_normal_form_is_idempotent_on_random_text():
     rng = random.Random(20261113)
-    alphabet = "abcAB s-.,–  "
+    alphabet = "abcAB s-.,;:–\t 1  "
     for _ in range(2000):
         spelling = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
         assert normal_form(normal_form(spelling)) == normal_form(spelling), spelling
@@ -99,6 +101,22 @@ def test_normal_form_is_idempotent_on_random_text():
 def test_normal_form_drops_plural_s_once():
     assert normal_form("bosses") == "bosse"
     assert normal_form("bosse") == "bosse"
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [
+        ("glasses.s", "glasses.s"),
+        ("bosses.s", "bosses.s"),
+        ("models.s", "models.s"),
+        ("GANs.", "gan"),
+        ("LLMs,.", "llm"),
+        ("Low-Rank Adaptation.-.", "low rank adaptation"),
+    ],
+)
+def test_normal_form_strips_edges_then_drops_plural_s_once(spelling, expected):
+    assert normal_form(spelling) == expected
+    assert normal_form(expected) == expected
 
 
 def test_normal_form_of_nothing_is_empty():

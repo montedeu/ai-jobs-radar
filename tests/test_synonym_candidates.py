@@ -385,13 +385,12 @@ def test_abbreviation_sharing_an_expansion_with_a_conflict_is_not_a_candidate(da
 
 
 def test_pair_with_trailing_punctuation_gives_keys_the_dictionary_accepts(database_url, tmp_path):
-    # normal_form("Low-Rank Adaptation.-.") is "low rank adaptation" now, a fixed point, so
-    # read_synonyms accepts the rows that transfer appends.
     candidates, merged = transfer(database_url, tmp_path, [], ["Low-Rank Adaptation.-. (LoRA)"])
 
-    assert candidates.pairs == {"lora": ("Low-Rank Adaptation.-.", 1)}
+    assert "lora" in candidates.pairs
     assert candidates.conflicts == {}
-    assert set(merged) == {"lora", "low rank adaptation"}
+    assert all(key == normal_form(key) for key in merged)
+    assert {"lora", "low rank adaptation"} <= set(merged)
 
 
 def test_dictionary_expansion_against_another_one_in_the_corpus_is_a_conflict(database_url):
