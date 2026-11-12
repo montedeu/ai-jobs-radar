@@ -84,10 +84,24 @@ def papers(connection):
         add_paper(connection, arxiv_id)
 
 
-def go(connection, client, *, confirm=True, config=DEFAULT_CONFIG, model=EXTRACTION_MODEL):
+def go(
+    connection,
+    client,
+    *,
+    confirm=True,
+    config=DEFAULT_CONFIG,
+    model=EXTRACTION_MODEL,
+    restart=False,
+):
     lines = []
     plan = full_run.run(
-        connection, client, model=model, config=config, confirm=confirm, out=lines.append
+        connection,
+        client,
+        model=model,
+        config=config,
+        confirm=confirm,
+        restart=restart,
+        out=lines.append,
     )
     return plan, "\n".join(lines)
 
@@ -206,8 +220,7 @@ def test_parts_sent_before_the_ceiling_stay_and_the_rest_is_not_sent(connection,
 
     assert sent_ids(client) == IDS[:2]
     assert count(connection, "extraction_batch") == 2  # the spent one and the sent part
-    assert "1 of 3" in text
-    assert "2 left" in text
+    assert "sent 1, skipped 0, left 2" in text
     assert plan.batches == 3
 
 
@@ -250,6 +263,9 @@ def test_papers_in_flight_are_not_sent_again(connection, papers):
 
 def test_full_run_with_another_request_config_starts_a_new_run(connection, papers):
     go(connection, PerPaperModel())
+    first = connection.execute("SELECT id FROM extraction_run").fetchone()[0]
+    mark_done(connection, first, *IDS)
+    assert runs.promote(connection) == first
     client = PerPaperModel()
 
     plan, _ = go(connection, client, config=OTHER_CONFIG)
@@ -384,3 +400,139 @@ def test_cli_with_confirm_sends_the_history(cli_client, papers, connection):
 
     (client,) = cli_client
     assert sent_ids(client) == IDS
+
+
+def test_head_run_with_another_config_is_not_continued_and_nothing_is_created(connection, papers):
+    head = start_run(connection, model=EXTRACTION_MODEL, config=OTHER_CONFIG, full=True)
+    client = PerPaperModel()
+
+    plan, text = go(connection, client)
+
+    assert plan.status == full_run.NEWER_RUN_OTHER_CONFIG
+    assert plan.refused
+    assert f"newer unfinished full run {head} with another configuration" in text
+    assert client.calls == []
+    assert count(connection, "extraction_run") == 1
+
+
+def test_cli_exits_with_an_error_when_the_head_run_has_another_config(
+    cli_client, papers, connection
+):
+    start_run(connection, model=EXTRACTION_MODEL, config=OTHER_CONFIG, full=True)
+
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["full-run", "--confirm"])
+
+    assert stop.value.code == 1
+
+
+def test_blocked_run_is_not_paid_for_even_with_papers_missing(connection, papers):
+    run_id = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    for arxiv_id in IDS[:2]:
+        give_up_on(connection, run_id, arxiv_id)
+    client = PerPaperModel()
+
+    plan, text = go(connection, client)
+
+    assert plan.status == full_run.BLOCKED
+    assert plan.refused
+    assert "will not become current" in text
+    assert "--restart" in text
+    assert "submit_batch" not in client.calls
+    assert count(connection, "extraction_run") == 1
+
+
+def test_restart_starts_a_new_run_past_the_head_of_the_queue(connection, papers):
+    run_id = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    for arxiv_id in IDS[:2]:
+        give_up_on(connection, run_id, arxiv_id)
+    client = PerPaperModel()
+
+    plan, _ = go(connection, client, restart=True)
+
+    assert plan.run_id is None
+    assert count(connection, "extraction_run") == 2
+    assert sent_ids(client) == IDS
+    assert runs.head_candidate(connection) != run_id
+
+
+def test_restart_needs_confirm(cli_client, papers, connection, capsys):
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["full-run", "--restart"])
+
+    assert stop.value.code != 0
+    assert "--confirm" in capsys.readouterr().err
+    assert count(connection, "extraction_run") == 0
+
+
+def test_papers_all_stuck_in_sending_say_what_to_do(connection, papers):
+    run_id = start_run(connection, model=EXTRACTION_MODEL, full=True)
+    mark_done(connection, run_id, *IDS[2:])
+    with pytest.raises(RuntimeError):
+        extraction.submit(connection, PerPaperModel(fail_submit=True), run_id, IDS[:2])
+    client = PerPaperModel()
+
+    plan, text = go(connection, client)
+
+    assert plan.status == full_run.NOTHING_TO_SEND
+    assert plan.refused
+    assert "sending" in text
+    assert "--restart" in text
+    assert client.calls == []
+
+
+def test_second_command_at_once_does_nothing(connection, papers, database_url):
+    with psycopg.connect(database_url, autocommit=True) as other:
+        other.execute("SELECT pg_advisory_lock(hashtext('full_run'))")
+        client = PerPaperModel()
+
+        plan, text = go(connection, client)
+
+        assert plan.status == full_run.LOCKED
+        assert plan.refused
+        assert "another full-run command is already running" in text.lower()
+        assert client.calls == []
+        assert count(connection, "extraction_run") == 0
+    # The lock of a finished command is released: a command goes through.
+    go(connection, PerPaperModel(), confirm=False)
+    with psycopg.connect(database_url, autocommit=True) as other:
+        assert other.execute("SELECT pg_try_advisory_lock(hashtext('full_run'))").fetchone()[0]
+
+
+def test_part_with_nothing_left_to_send_is_skipped_and_counted(connection, papers, monkeypatch):
+    real = extraction.submit
+    calls = []
+
+    def submit(*args, **kwargs):
+        calls.append(1)
+        return None if len(calls) == 1 else real(*args, **kwargs)
+
+    monkeypatch.setattr(extraction, "submit", submit)
+
+    _, text = go(connection, PerPaperModel())
+
+    assert "sent 2, skipped 1, left 0" in text
+
+
+def test_ceiling_after_skipped_parts_is_a_stop_not_an_error(connection, papers, monkeypatch):
+    calls = []
+
+    def submit(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return None
+        raise BudgetExceeded("over")
+
+    monkeypatch.setattr(extraction, "submit", submit)
+
+    _, text = go(connection, PerPaperModel())
+
+    assert "Stopped at the ceiling" in text
+    assert "sent 0, skipped 1, left 2" in text
+
+
+def test_the_actual_number_of_papers_is_printed_after_the_run_is_created(connection, papers):
+    _, text = go(connection, PerPaperModel())
+
+    assert "Sending 5 papers in 3 parts" in text
+    assert "slightly higher" in text

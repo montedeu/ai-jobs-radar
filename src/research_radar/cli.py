@@ -40,7 +40,14 @@ def main(argv: list[str] | None = None) -> None:
     parsers["full-run"].add_argument(
         "--confirm", action="store_true", help="send; without it only the estimate is shown"
     )
+    parsers["full-run"].add_argument(
+        "--restart",
+        action="store_true",
+        help="with --confirm: start a new full run even if an unfinished one exists",
+    )
     args = parser.parse_args(argv)
+    if args.command == "full-run" and args.restart and not args.confirm:
+        parser.error("--restart works only together with --confirm")
 
     # Imported per command: a job does not pay for loading the web stack.
     if args.command == "migrate":
@@ -79,11 +86,15 @@ def main(argv: list[str] | None = None) -> None:
             connection.autocommit = True
             try:
                 plan = full_run.run(
-                    connection, client, model=EXTRACTION_MODEL, confirm=args.confirm
+                    connection,
+                    client,
+                    model=EXTRACTION_MODEL,
+                    confirm=args.confirm,
+                    restart=args.restart,
                 )
             except extraction.BudgetExceeded as error:
                 raise SystemExit(f"error: {error}") from error
-        if plan.status in (full_run.EMPTY_HISTORY, full_run.BLOCKED):
+        if plan.refused:
             raise SystemExit(1)
     elif args.command == "serve-mcp":
         from research_radar import mcp_server

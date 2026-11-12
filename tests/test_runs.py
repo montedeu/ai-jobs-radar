@@ -2,7 +2,7 @@ import psycopg
 import pytest
 
 from research_radar.extraction import start_run
-from research_radar.runs import current_run, missing_papers, promote
+from research_radar.runs import current_run, head_candidate, missing_papers, promote, run_state
 from research_radar.settings import EXTRACTION_MAX_ATTEMPTS, EXTRACTION_MODEL
 
 
@@ -309,3 +309,40 @@ def test_start_run_refuses_a_connection_with_a_transaction_open(connection):
 def test_missing_papers_of_an_unknown_run_is_an_error(connection, papers):
     with pytest.raises(LookupError):
         missing_papers(connection, 999999)
+
+
+def test_run_state_counts_what_holds_the_run_back_and_what_it_gave_up_on(connection, papers):
+    run = new_run(connection)
+    mark_done(connection, run, CL[0])
+    fail_attempts(connection, run, CL[1], EXTRACTION_MAX_ATTEMPTS)
+
+    state = run_state(connection, run)
+
+    assert (state.missing, state.given_up, state.scope) == (1, 1, 3)
+    assert state.blocked is False
+
+
+def test_run_state_is_blocked_at_the_same_limit_as_promote(connection, papers):
+    run = new_run(connection)
+    for arxiv_id in CL[:2]:
+        fail_attempts(connection, run, arxiv_id, EXTRACTION_MAX_ATTEMPTS)
+
+    # Papers are still missing: a blocked run is blocked whatever else is left.
+    state = run_state(connection, run)
+
+    assert (state.missing, state.given_up, state.blocked) == (1, 2, True)
+
+
+def test_head_candidate_is_the_newest_unfinished_full_run_after_the_current(connection, papers):
+    assert head_candidate(connection) is None
+    older = new_run(connection)
+    pilot = new_run(connection, full=False)
+    newer = new_run(connection)
+    assert head_candidate(connection) == newer
+    mark_done(connection, older, *CL)
+    assert promote(connection) == older
+    assert head_candidate(connection) == newer
+    mark_done(connection, newer, *CL)
+    assert promote(connection) == newer
+    assert head_candidate(connection) is None
+    assert pilot not in (older, newer)
