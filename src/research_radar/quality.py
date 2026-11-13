@@ -15,8 +15,9 @@ import psycopg
 from pydantic import BaseModel, ValidationError
 
 from research_radar import normalize
-from research_radar.extraction import require_idle
+from research_radar.extraction import GIVEN_UP_SQL, require_idle
 from research_radar.mentions import EntityType, Mention
+from research_radar.settings import EXTRACTION_MAX_ATTEMPTS
 from research_radar.synonyms import current_dictionary
 
 LABELS = ("before", "after")
@@ -48,6 +49,8 @@ class Measurement:
     by_type: dict[str, Score]
     overall_typed: Score
     overall_untyped: Score
+    # Gold papers the run gave up on: counted as an empty prediction (ADR 0005, #65).
+    given_up_papers: list[str]
 
 
 def read_gold(path: Path) -> list[GoldPaper]:
@@ -154,7 +157,15 @@ def _measure(
             (run_id, ids),
         )
     }
-    if unfinished := sorted(set(ids) - current):
+    # A paper the run gave up on (the rule of the run itself) has no mark and never will: it
+    # counts as an empty prediction, so the failure shows in the recall instead of blocking.
+    given_up = {
+        r[0]
+        for r in connection.execute(
+            GIVEN_UP_SQL, {"run": run_id, "attempts": EXTRACTION_MAX_ATTEMPTS}
+        )
+    } & (set(ids) - current)
+    if unfinished := sorted(set(ids) - current - given_up):
         raise ValueError(
             f"run {run_id} has no completion mark for the current abstract of gold papers: "
             + ", ".join(unfinished)
@@ -172,7 +183,7 @@ def _measure(
         " WHERE run_id = %s AND arxiv_id = ANY(%s)",
         (run_id, ids),
     ).fetchall()
-    predicted = _triples(stored, synonyms)
+    predicted = _triples([row for row in stored if row[0] not in given_up], synonyms)
     wanted = _triples(
         [(p.arxiv_id, m.entity_type, m.spelling) for p in gold for m in p.mentions], synonyms
     )
@@ -190,6 +201,7 @@ def _measure(
         },
         overall_typed=_score(predicted, wanted),
         overall_untyped=_score({t[:2] for t in predicted}, {t[:2] for t in wanted}),
+        given_up_papers=sorted(given_up),
     )
     connection.execute(
         "INSERT INTO quality_measurement (run_id, dictionary_sha256, gold_sha256, rules_sha256,"
@@ -205,6 +217,10 @@ def _measure(
                     "by_type": {k: asdict(v) for k, v in result.by_type.items()},
                     "overall_typed": asdict(result.overall_typed),
                     "overall_untyped": asdict(result.overall_untyped),
+                    "given_up_papers": {
+                        "count": len(result.given_up_papers),
+                        "ids": result.given_up_papers,
+                    },
                 }
             ),
         ),
@@ -248,9 +264,13 @@ def format_scores(
     ]
 
 
+def _given_up_line(ids: list[str]) -> str:
+    return f"  given up: {len(ids)} ({', '.join(ids)})" if ids else "  given up: 0"
+
+
 def format_measurement(result: Measurement) -> str:
     lines = format_scores(result.by_type, result.overall_typed, result.overall_untyped)
-    return "\n".join([*lines, CAVEAT])
+    return "\n".join([*lines, _given_up_line(result.given_up_papers), CAVEAT])
 
 
 def _score_from(record: object) -> Score:
@@ -274,10 +294,13 @@ def _block(label: str, row) -> list[str]:
     by_type = {kind: _score_from(v) for kind, v in (metrics.get("by_type") or {}).items()}
     typed = _score_from(metrics.get("overall_typed"))
     untyped = _score_from(metrics.get("overall_untyped"))
+    given_up = metrics.get("given_up_papers")  # rows of earlier versions have none
+    ids = [str(i) for i in given_up.get("ids", [])] if isinstance(given_up, dict) else []
     return [
         f"{label}: {measured_at:%Y-%m-%d}, run {run_id}, dictionary {(dictionary or 'none')[:12]}, "
         f"rules {(rules or 'none')[:12]}, gold {gold_hash[:12]}",
         *format_scores(by_type, typed, untyped),
+        _given_up_line(ids),
     ]
 
 
