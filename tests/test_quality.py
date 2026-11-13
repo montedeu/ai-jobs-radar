@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import json
 from datetime import date
 
@@ -305,3 +306,83 @@ def test_cli_measure_reports_a_bad_gold_file(world, database_url, monkeypatch, t
     path.write_text("{not json\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="line 1"):
         cli.main(["measure", "--run", str(world), "--gold", str(path), "--label", "before"])
+
+
+def test_gold_paper_with_a_stale_abstract_stops_the_measurement(connection, world):
+    connection.execute("UPDATE paper SET abstract_hash = 'changed' WHERE arxiv_id = '2511.00002'")
+    with pytest.raises(ValueError, match="2511.00002"):
+        measure(connection, world)
+    assert logged(connection) == 0
+
+
+def test_dictionary_key_by_old_rules_stops_the_measurement(connection, world):
+    connection.execute("INSERT INTO synonym VALUES ('Adapters', 'adapter'), ('lora', 'LoRA')")
+    with pytest.raises(ValueError, match="Adapters.*load-synonyms"):
+        measure(connection, world)
+    assert logged(connection) == 0
+
+
+def test_measurement_logs_the_hash_of_the_normal_form_rules(
+    connection, world, monkeypatch, tmp_path
+):
+    measure(connection, world)
+    source = tmp_path / "normalize_other.py"
+    source.write_text("def normal_form(spelling):\n    return spelling\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("normalize_other", source)
+    other = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(other)
+    monkeypatch.setattr(quality, "normalize", other)
+    measure(connection, world)
+    first, second = (
+        row[0]
+        for row in connection.execute("SELECT rules_sha256 FROM quality_measurement ORDER BY id")
+    )
+    assert first and second and first != second
+
+
+def test_measure_leaves_the_isolation_level_as_it_was(connection, world):
+    before = connection.isolation_level
+    measure(connection, world)
+    assert connection.isolation_level == before
+
+
+def test_report_pairs_before_with_the_after_of_the_same_basis(connection, world):
+    measure(connection, world, sha="oldgold-0123456789", label="before")
+    connection.execute("INSERT INTO synonym_version (file_sha256, entries) VALUES ('dict2', 0)")
+    measure(connection, world, sha="newgold-0123456789", label="after")
+    text = quality.report(connection)
+    assert "different basis" in text
+    assert "oldgold-0123" in text and "newgold-0123" in text
+    measure(connection, world, sha="samegold-012345678", label="before")
+    text = quality.report(connection)
+    assert "different basis" not in text
+    assert "samegold-012" in text
+    assert "oldgold-0123" not in text
+
+
+def test_report_survives_old_log_rows(connection, world):
+    connection.execute(
+        "INSERT INTO quality_measurement (run_id, gold_sha256, label, rules_sha256, metrics)"
+        " VALUES (%s, 'oldoldoldoldold', 'before', 'r',"
+        ' \'{"by_type": {"metric": {"precision": 1.0}}, "overall_typed": {}}\')',
+        (world,),
+    )
+    text = quality.report(connection)
+    assert "metric" in text and "oldoldoldold" in text
+
+
+def test_measure_prints_the_report_format(world, database_url, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    path = write_gold(tmp_path / "gold.jsonl")
+    cli.main(["measure", "--run", str(world), "--gold", str(path), "--label", "before"])
+    out = capsys.readouterr().out
+    assert "precision 0.50 (1/2)" in out
+    assert "precision n/a (0/0)" in out
+    assert "recall 0.75 (3/4)" in out
+    assert "one annotator" in out
+
+
+def test_parse_gold_reads_the_bytes_it_is_given():
+    raw = b'{"arxiv_id": "2511.00001", "mentions": []}\n{not json\n'
+    with pytest.raises(ValueError, match="line 2"):
+        quality.parse_gold(raw, "gold.jsonl")

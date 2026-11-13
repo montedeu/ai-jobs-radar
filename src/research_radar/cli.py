@@ -220,8 +220,9 @@ def main(argv: list[str] | None = None) -> None:
         from research_radar import database, quality
 
         try:
+            # Read once: the hash in the log is of the bytes that were parsed.
             raw = args.gold.read_bytes()
-            gold = quality.read_gold(args.gold)
+            gold = quality.parse_gold(raw, args.gold.name)
         except (OSError, ValueError) as error:
             raise SystemExit(f"error: {error}") from error
         with database.connect() as connection:
@@ -236,11 +237,7 @@ def main(argv: list[str] | None = None) -> None:
             except ValueError as error:
                 raise SystemExit(f"error: {error}") from error
         print(f"measurement logged ({result.label}, run {result.run_id})")
-        print(
-            f"overall, typed: precision {result.overall_typed.precision}, "
-            f"recall {result.overall_typed.recall}"
-        )
-        print(quality.CAVEAT)
+        print(quality.format_measurement(result))
     elif args.command == "measurements":
         from research_radar import database, quality
 

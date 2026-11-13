@@ -23,6 +23,7 @@ def upgrade() -> None:
             run_id            bigint NOT NULL REFERENCES extraction_run ON DELETE RESTRICT,
             dictionary_sha256 text,   -- null before the first dictionary load
             gold_sha256       text   NOT NULL,
+            rules_sha256      text   NOT NULL,   -- the source of the normalize module
             label             text   NOT NULL CHECK (label IN ('before', 'after')),
             metrics           jsonb  NOT NULL
         );
