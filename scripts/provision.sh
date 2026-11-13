@@ -201,7 +201,7 @@ finish() {
 
 # Provisions what the cloud skeleton needs: a GCP project, billing, Artifact Registry,
 # service accounts, Workload Identity Federation, a budget alert, the Neon database and
-# the MCP token in Secret Manager, the Cloud Scheduler job, and the GitHub variables the
+# the MCP token and the Anthropic keys in Secret Manager, the Cloud Scheduler job, and the GitHub variables the
 # deploy workflow reads. Every stage checks what already exists, so the wizard is safe to
 # re-run after a failure.
 #
@@ -551,27 +551,61 @@ say "Two keys from the Anthropic Console: one for extraction, one for the agent 
 say "deploy.yml hands '$EXTRACTION_KEY_SECRET' to the collect job as ANTHROPIC_API_KEY;"
 say "'$AGENT_KEY_SECRET' is kept for the agent and given to no job yet."
 step "Billing: prepaid credit on the account, auto-reload off (ceilings in CLAUDE.md)."
+step "If the console offers spend limits per workspace: a workspace per key, limits \$20 and \$5."
 step "API Keys → Create Key, once for each. Paste each key at the hidden prompt below."
+note "Enter on an empty prompt skips that key; run this stage again to add it later."
 open_url "https://console.anthropic.com/settings/keys"
+FIRST_KEY_SHA=""
 for ANTHROPIC_SECRET in "$EXTRACTION_KEY_SECRET" "$AGENT_KEY_SECRET"; do
   SKIP_KEY=0
+  REPLACING=0
   if has_secret "$ANTHROPIC_SECRET"; then
     say "Secret $ANTHROPIC_SECRET already holds a key."
-    confirm "Replace it?" || SKIP_KEY=1
+    confirm "Replace it?" && REPLACING=1 || SKIP_KEY=1
   fi
   if (( ! SKIP_KEY )); then
     while :; do
-      ask_secret ANTHROPIC_KEY "Paste the key for $ANTHROPIC_SECRET (hidden):"
-      [[ "$ANTHROPIC_KEY" =~ ^sk-ant-api[0-9]+-[A-Za-z0-9_-]{20,}$ ]] && break
-      warn "That doesn't look like an Anthropic API key (sk-ant-api…); try again."
+      ask_secret ANTHROPIC_KEY "Paste the key for $ANTHROPIC_SECRET (hidden, Enter skips):"
+      if [[ -z "$ANTHROPIC_KEY" ]]; then
+        warn "Skipped $ANTHROPIC_SECRET."
+        SKIP_KEY=1
+        break
+      fi
+      if [[ ! "$ANTHROPIC_KEY" =~ ^sk-ant-api[0-9]+-[A-Za-z0-9_-]{20,}$ ]]; then
+        warn "That doesn't look like an Anthropic API key (sk-ant-api…); try again."
+        continue
+      fi
+      KEY_SHA=$(printf '%s' "$ANTHROPIC_KEY" | sha256sum | cut -d' ' -f1)
+      if [[ "$KEY_SHA" == "$FIRST_KEY_SHA" ]]; then
+        warn "That is the extraction key again: the agent needs a key of its own; try again."
+        continue
+      fi
+      # Listing models is free; the key goes in a header read from stdin, not on the command line.
+      CODE=$(printf 'x-api-key: %s\r\n' "$ANTHROPIC_KEY" | curl -sS -o /dev/null -w '%{http_code}' \
+               -H @- -H 'anthropic-version: 2023-06-01' https://api.anthropic.com/v1/models || true)
+      [[ "$CODE" == 200 ]] && break
+      warn "The Anthropic API answered $CODE to this key (200 expected)."
+      confirm "Store it anyway?" && break
     done
-    store_secret "$ANTHROPIC_SECRET" "$ANTHROPIC_KEY"
-    unset ANTHROPIC_KEY
-    note "If this replaced a key, delete the old one in the console: its version is only disabled."
   fi
-  run gcloud secrets add-iam-policy-binding "$ANTHROPIC_SECRET" --project="$GCP_PROJECT_ID" \
-    --member="serviceAccount:$GCP_RUNTIME_SA" --role=roles/secretmanager.secretAccessor --format=none
+  if (( ! SKIP_KEY )); then
+    [[ "$ANTHROPIC_SECRET" == "$EXTRACTION_KEY_SECRET" ]] && FIRST_KEY_SHA="$KEY_SHA"
+    store_secret "$ANTHROPIC_SECRET" "$ANTHROPIC_KEY"
+    if (( REPLACING )); then
+      note "Delete the old key in the console once nothing uses it: its version is only disabled."
+      [[ "$ANTHROPIC_SECRET" == "$EXTRACTION_KEY_SECRET" ]] &&
+        note "Sent batches are read with a key of their workspace: create the new key in the same one, and delete the old after 'radar daily' has collected them."
+    fi
+  fi
+  unset ANTHROPIC_KEY KEY_SHA
+  if has_secret "$ANTHROPIC_SECRET"; then
+    run gcloud secrets add-iam-policy-binding "$ANTHROPIC_SECRET" --project="$GCP_PROJECT_ID" \
+      --member="serviceAccount:$GCP_RUNTIME_SA" --role=roles/secretmanager.secretAccessor --format=none
+  elif [[ "$ANTHROPIC_SECRET" == "$EXTRACTION_KEY_SECRET" ]]; then
+    warn "$ANTHROPIC_SECRET holds no key: the collect job's deploy fails until it does."
+  fi
 done
+unset FIRST_KEY_SHA
 pause
 
 # ── 12 ────────────────────────────────────────────────────────────────────
