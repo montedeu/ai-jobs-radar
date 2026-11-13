@@ -219,6 +219,8 @@ SCHEDULER_SA_NAME="radar-scheduler"
 BUDGET_NAME="ml-research-radar"
 DB_SECRET="database-url"
 TOKEN_SECRET="mcp-token"
+EXTRACTION_KEY_SECRET="anthropic-extraction-key"
+AGENT_KEY_SECRET="anthropic-agent-key"
 COLLECT_JOB="radar-collect"
 SCHEDULE_NAME="radar-collect-daily"
 # 10:00 in Astana, Monday to Friday: arXiv's new records are out by about 08:30 there.
@@ -276,7 +278,7 @@ has_secret() {
 
 run_wizard() {
 
-TOTAL_STAGES=13
+TOTAL_STAGES=14
 
 cd "$(dirname "$0")/.."
 
@@ -541,19 +543,38 @@ run gcloud secrets add-iam-policy-binding "$TOKEN_SECRET" --project="$GCP_PROJEC
   --member="serviceAccount:$GCP_RUNTIME_SA" --role=roles/secretmanager.secretAccessor --format=none
 note "To read it later:"
 note "  gcloud secrets versions access latest --secret=$TOKEN_SECRET --project=$GCP_PROJECT_ID"
-# The Anthropic keys are created by hand in the console and stored by the developer (#22);
-# deploy.yml hands anthropic-extraction-key to the collect job, so the runtime account reads it.
-for ANTHROPIC_SECRET in anthropic-extraction-key anthropic-agent-key; do
-  if gcloud secrets describe "$ANTHROPIC_SECRET" --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
-    run gcloud secrets add-iam-policy-binding "$ANTHROPIC_SECRET" --project="$GCP_PROJECT_ID" \
-      --member="serviceAccount:$GCP_RUNTIME_SA" --role=roles/secretmanager.secretAccessor --format=none
-  else
-    warn "Secret $ANTHROPIC_SECRET does not exist yet: store the key (#22), then run this again before deploying."
-  fi
-done
 pause
 
 # ── 11 ────────────────────────────────────────────────────────────────────
+stage "Anthropic API keys → Secret Manager"
+say "Two keys from the Anthropic Console: one for extraction, one for the agent (#22)."
+say "deploy.yml hands '$EXTRACTION_KEY_SECRET' to the collect job as ANTHROPIC_API_KEY;"
+say "'$AGENT_KEY_SECRET' is kept for the agent and given to no job yet."
+step "Billing: prepaid credit on the account, auto-reload off (ceilings in CLAUDE.md)."
+step "API Keys → Create Key, once for each. Paste each key at the hidden prompt below."
+open_url "https://console.anthropic.com/settings/keys"
+for ANTHROPIC_SECRET in "$EXTRACTION_KEY_SECRET" "$AGENT_KEY_SECRET"; do
+  SKIP_KEY=0
+  if has_secret "$ANTHROPIC_SECRET"; then
+    say "Secret $ANTHROPIC_SECRET already holds a key."
+    confirm "Replace it?" || SKIP_KEY=1
+  fi
+  if (( ! SKIP_KEY )); then
+    while :; do
+      ask_secret ANTHROPIC_KEY "Paste the key for $ANTHROPIC_SECRET (hidden):"
+      [[ "$ANTHROPIC_KEY" =~ ^sk-ant-api[0-9]+-[A-Za-z0-9_-]{20,}$ ]] && break
+      warn "That doesn't look like an Anthropic API key (sk-ant-api…); try again."
+    done
+    store_secret "$ANTHROPIC_SECRET" "$ANTHROPIC_KEY"
+    unset ANTHROPIC_KEY
+    note "If this replaced a key, delete the old one in the console: its version is only disabled."
+  fi
+  run gcloud secrets add-iam-policy-binding "$ANTHROPIC_SECRET" --project="$GCP_PROJECT_ID" \
+    --member="serviceAccount:$GCP_RUNTIME_SA" --role=roles/secretmanager.secretAccessor --format=none
+done
+pause
+
+# ── 12 ────────────────────────────────────────────────────────────────────
 stage "Cloud Scheduler: the daily collect job"
 say "One scheduler job starts the Cloud Run job '$COLLECT_JOB' at $SCHEDULE_CRON ($SCHEDULE_TZ)."
 if gcloud scheduler jobs describe "$SCHEDULE_NAME" --location="$GCP_REGION" --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
@@ -576,7 +597,7 @@ else
 fi
 pause
 
-# ── 12 ────────────────────────────────────────────────────────────────────
+# ── 13 ────────────────────────────────────────────────────────────────────
 stage "GitHub secret scanning push protection"
 PP=$(gh api "repos/$GITHUB_REPO" --jq '.security_and_analysis.secret_scanning_push_protection.status')
 if [[ "$PP" == "enabled" ]]; then
@@ -594,7 +615,7 @@ JSON
 fi
 pause
 
-# ── 13 ────────────────────────────────────────────────────────────────────
+# ── 14 ────────────────────────────────────────────────────────────────────
 stage "Prove WIF works from GitHub Actions"
 say "Only a workflow on main can authenticate, so the proof runs on main: the 'WIF check'"
 say "workflow signs in as the deployer and reads the image repository. It deploys nothing."
