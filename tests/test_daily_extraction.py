@@ -376,7 +376,7 @@ def test_without_a_key_the_step_is_skipped_when_there_is_work(
     assert make.calls == []
     (row,) = [r for r in job_rows(connection) if r[0] == "extract"]
     assert row[1] == "skipped"
-    assert "#22" in row[2]["skipped"]
+    assert "ANTHROPIC_API_KEY" in row[2]["skipped"]
     assert row[2]["collected"] == {}
     assert row[2]["due"] == 2
 
@@ -491,4 +491,4 @@ def test_without_a_key_a_waiting_batch_skips_the_step_and_the_command_exits_clea
         ("collect", "succeeded"),
         ("extract", "skipped"),
     ]
-    assert "#22" in job_rows(connection)[1][2]["skipped"]
+    assert "ANTHROPIC_API_KEY" in job_rows(connection)[1][2]["skipped"]

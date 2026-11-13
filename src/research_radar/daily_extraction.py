@@ -72,7 +72,10 @@ class _LazyClient:
     def resolve(self) -> extraction.ModelClient:
         if self._client is None:
             if not os.environ.get("ANTHROPIC_API_KEY"):
-                raise RunSkipped("ключ Anthropic не подключён к задаче (#22)")
+                raise RunSkipped(
+                    "нет ANTHROPIC_API_KEY в окружении (задаче его даёт секрет "
+                    "anthropic-extraction-key)"
+                )
             self._client = self._factory()
         return self._client
 
