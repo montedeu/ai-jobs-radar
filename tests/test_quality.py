@@ -8,7 +8,7 @@ import pytest
 
 from research_radar import cli, quality
 from research_radar.extraction import start_run
-from research_radar.settings import EXTRACTION_MODEL
+from research_radar.settings import EXTRACTION_MAX_ATTEMPTS, EXTRACTION_MODEL
 
 GOLD = [
     {
@@ -386,3 +386,116 @@ def test_parse_gold_reads_the_bytes_it_is_given():
     raw = b'{"arxiv_id": "2511.00001", "mentions": []}\n{not json\n'
     with pytest.raises(ValueError, match="line 2"):
         quality.parse_gold(raw, "gold.jsonl")
+
+
+def give_up(connection, run, arxiv_id, *, abstract_hash="h", count=EXTRACTION_MAX_ATTEMPTS):
+    """Collected batches that ended with an invalid answer for the paper, count times."""
+    for _ in range(count):
+        batch_id = connection.execute(
+            "INSERT INTO extraction_batch (run_id, status, estimated_cost_usd)"
+            " VALUES (%s, 'collected', 0) RETURNING id",
+            (run,),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO extraction_batch_paper (batch_id, arxiv_id, abstract_hash, outcome)"
+            " VALUES (%s, %s, %s, 'invalid')",
+            (batch_id, arxiv_id, abstract_hash),
+        )
+
+
+def gold_with_given_up_paper(connection):
+    """GOLD plus 2511.00004 with two mentions, a paper the test may have the run give up on."""
+    add_paper(connection, "2511.00004")
+    return gold_papers(
+        [
+            *GOLD,
+            {
+                "arxiv_id": "2511.00004",
+                "mentions": [
+                    {"entity_type": "method", "spelling": "adapters"},
+                    {"entity_type": "task", "spelling": "parsing"},
+                ],
+            },
+        ]
+    )
+
+
+def test_gold_paper_the_run_gave_up_on_counts_as_an_empty_prediction(connection, world):
+    gold = gold_with_given_up_paper(connection)
+    give_up(connection, world, "2511.00004")
+    result = measure(connection, world, gold)
+    # The same 2 of 5 predicted hit as without the paper; its 2 mentions are only missed.
+    assert (result.overall_typed.predicted, result.overall_typed.true_positives) == (5, 2)
+    assert result.overall_typed.precision == 2 / 5
+    assert (result.overall_typed.gold, result.overall_typed.recall) == (6, 2 / 6)
+    assert result.given_up_papers == ("2511.00004",)
+
+
+def test_given_up_papers_are_logged_and_reported(connection, world):
+    gold = gold_with_given_up_paper(connection)
+    give_up(connection, world, "2511.00004")
+    result = measure(connection, world, gold)
+    assert "given up: 1 (2511.00004)" in quality.format_measurement(result)
+    metrics = connection.execute("SELECT metrics FROM quality_measurement").fetchone()[0]
+    assert metrics["given_up_papers"] == ["2511.00004"]
+    assert "given up: 1 (2511.00004)" in quality.report(connection)
+
+
+def test_measurement_without_given_up_papers_says_zero(connection, world):
+    result = measure(connection, world)
+    assert result.given_up_papers == ()
+    assert "given up: 0" in quality.format_measurement(result)
+
+
+def test_paper_without_a_mark_and_not_given_up_still_stops_the_measurement(connection, world):
+    gold = gold_with_given_up_paper(connection)
+    give_up(connection, world, "2511.00004", count=EXTRACTION_MAX_ATTEMPTS - 1)
+    with pytest.raises(ValueError, match="2511.00004"):
+        measure(connection, world, gold)
+    assert logged(connection) == 0
+
+
+def test_attempts_on_an_old_abstract_are_not_a_give_up(connection, world):
+    gold = gold_with_given_up_paper(connection)
+    give_up(connection, world, "2511.00004", abstract_hash="old")
+    with pytest.raises(ValueError, match="2511.00004"):
+        measure(connection, world, gold)
+    assert logged(connection) == 0
+
+
+def test_report_reads_old_rows_without_given_up_papers(connection, world):
+    connection.execute(
+        "INSERT INTO quality_measurement (run_id, gold_sha256, label, rules_sha256, metrics)"
+        " VALUES (%s, 'oldoldoldoldold', 'before', 'r', '{}')",
+        (world,),
+    )
+    assert "given up: 0" in quality.report(connection)
+
+
+def test_given_up_paper_with_mentions_of_an_old_abstract_predicts_nothing(connection, world):
+    gold = gold_with_given_up_paper(connection)
+    # Extracted on the old abstract, then the abstract changed and the run gave up on the new.
+    connection.execute(
+        "INSERT INTO paper_extraction (run_id, arxiv_id, abstract_hash, input_tokens,"
+        " output_tokens) VALUES (%s, '2511.00004', 'old', 1, 1)",
+        (world,),
+    )
+    for kind, spelling in [("method", "adapters"), ("task", "parsing")]:
+        connection.execute(
+            "INSERT INTO mention (run_id, arxiv_id, entity_type, spelling, normal_form)"
+            " VALUES (%s, '2511.00004', %s, %s, %s)",
+            (world, kind, spelling, spelling),
+        )
+    give_up(connection, world, "2511.00004")
+    result = measure(connection, world, gold)
+    assert (result.overall_typed.predicted, result.overall_typed.true_positives) == (5, 2)
+    assert result.given_up_papers == ("2511.00004",)
+
+
+def test_paper_with_attempts_and_a_current_mark_is_not_given_up(connection, world):
+    gold = gold_with_given_up_paper(connection)
+    extract(connection, world, "2511.00004", [("method", "adapters")])
+    give_up(connection, world, "2511.00004")
+    result = measure(connection, world, gold)
+    assert result.given_up_papers == ()
+    assert (result.overall_typed.predicted, result.overall_typed.true_positives) == (6, 3)
