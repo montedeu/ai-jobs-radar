@@ -52,6 +52,8 @@ class Measurement:
     overall_untyped: Score
     # Gold papers the run gave up on: counted as an empty prediction (ADR 0005, #65).
     given_up_papers: tuple[str, ...]
+    # Gold papers with a mark under an older abstract: scored by the mentions of that mark (#71).
+    stale_papers: tuple[str, ...]
 
 
 def read_gold(path: Path) -> list[GoldPaper]:
@@ -148,9 +150,10 @@ def _measure(
     if missing := sorted(set(ids) - known):
         raise ValueError(f"gold papers not in the database: {', '.join(missing)}")
     # A paper with a mark under any abstract is extracted: its mentions are scored as the
-    # service serves them, the old ones included (#71). Only a paper with no mark at all
-    # can be given up on, and then it counts as an empty prediction, so the failure shows
-    # in the recall instead of blocking (ADR 0005, #65).
+    # service serves them, the old ones included (#71). The run may still have given up on
+    # its new abstract; then it is listed as stale, not as given up. A paper with no mark at
+    # all and given up on counts as an empty prediction, so the failure shows in the recall
+    # instead of blocking (ADR 0005, #65).
     marked = {
         r[0]
         for r in connection.execute(
@@ -159,6 +162,14 @@ def _measure(
         )
     }
     unmarked = set(ids) - marked
+    stale_ids = {
+        r[0]
+        for r in connection.execute(
+            "SELECT e.arxiv_id FROM paper_extraction e JOIN paper p ON p.arxiv_id = e.arxiv_id"
+            " WHERE e.run_id = %s AND e.arxiv_id = ANY(%s) AND e.abstract_hash <> p.abstract_hash",
+            (run_id, ids),
+        )
+    }
     given_up = {
         r[0]
         for r in connection.execute(
@@ -183,7 +194,9 @@ def _measure(
         " WHERE run_id = %s AND arxiv_id = ANY(%s)",
         (run_id, ids),
     ).fetchall()
-    predicted = _triples([row for row in stored if row[0] not in given_up], synonyms)
+    # A paper with no mark has no mentions (mention references paper_extraction), so the
+    # given-up papers have none to filter out here.
+    predicted = _triples(stored, synonyms)
     wanted = _triples(
         [(p.arxiv_id, m.entity_type, m.spelling) for p in gold for m in p.mentions], synonyms
     )
@@ -202,6 +215,7 @@ def _measure(
         overall_typed=_score(predicted, wanted),
         overall_untyped=_score({t[:2] for t in predicted}, {t[:2] for t in wanted}),
         given_up_papers=tuple(sorted(given_up)),
+        stale_papers=tuple(sorted(stale_ids)),
     )
     connection.execute(
         "INSERT INTO quality_measurement (run_id, dictionary_sha256, gold_sha256, rules_sha256,"
@@ -218,6 +232,7 @@ def _measure(
                     "overall_typed": asdict(result.overall_typed),
                     "overall_untyped": asdict(result.overall_untyped),
                     "given_up_papers": list(result.given_up_papers),
+                    "stale_papers": list(result.stale_papers),
                 }
             ),
         ),
@@ -261,13 +276,20 @@ def format_scores(
     ]
 
 
-def _given_up_line(ids: Sequence[str]) -> str:
-    return f"  given up: {len(ids)} ({', '.join(ids)})" if ids else "  given up: 0"
+def _ids_line(name: str, ids: Sequence[str]) -> str:
+    return f"  {name}: {len(ids)} ({', '.join(ids)})" if ids else f"  {name}: 0"
 
 
 def format_measurement(result: Measurement) -> str:
     lines = format_scores(result.by_type, result.overall_typed, result.overall_untyped)
-    return "\n".join([*lines, _given_up_line(result.given_up_papers), CAVEAT])
+    return "\n".join(
+        [
+            *lines,
+            _ids_line("given up", result.given_up_papers),
+            _ids_line("stale", result.stale_papers),
+            CAVEAT,
+        ]
+    )
 
 
 def _score_from(record: object) -> Score:
@@ -285,24 +307,30 @@ def _score_from(record: object) -> Score:
 _LOG_COLUMNS = "measured_at, run_id, dictionary_sha256, rules_sha256, gold_sha256, metrics"
 
 
+def _papers(metrics: dict, key: str) -> tuple[str, ...]:
+    # Rows written by an earlier version of the code lack the lists.
+    return tuple(metrics.get(key) or [])
+
+
 def _block(label: str, row) -> list[str]:
     measured_at, run_id, dictionary, rules, gold_hash, metrics = row
     metrics = metrics if isinstance(metrics, dict) else {}
     by_type = {kind: _score_from(v) for kind, v in (metrics.get("by_type") or {}).items()}
     typed = _score_from(metrics.get("overall_typed"))
     untyped = _score_from(metrics.get("overall_untyped"))
-    ids = metrics.get("given_up_papers") or []  # rows of earlier versions have none
     return [
         f"{label}: {measured_at:%Y-%m-%d}, run {run_id}, dictionary {(dictionary or 'none')[:12]}, "
         f"rules {(rules or 'none')[:12]}, gold {gold_hash[:12]}",
         *format_scores(by_type, typed, untyped),
-        _given_up_line(ids),
+        _ids_line("given up", _papers(metrics, "given_up_papers")),
+        _ids_line("stale", _papers(metrics, "stale_papers")),
     ]
 
 
 def report(connection: psycopg.Connection) -> str:
     """The latest 'after' and the latest 'before' measured on the same basis as it (run,
-    dictionary and rules), each figure with the number of mentions behind it."""
+    dictionary, rules, given up and stale papers), each figure with the number of mentions
+    behind it."""
     after = connection.execute(
         f"SELECT {_LOG_COLUMNS} FROM quality_measurement WHERE label = 'after'"
         " ORDER BY id DESC LIMIT 1"
@@ -315,12 +343,17 @@ def report(connection: psycopg.Connection) -> str:
         lines = _block("before", before) if before else ["before: no measurements"]
         lines.append("after: no measurements")
         return "\n".join([*lines, CAVEAT])
-    before = connection.execute(
+    candidates = connection.execute(
         f"SELECT {_LOG_COLUMNS} FROM quality_measurement WHERE label = 'before'"
         " AND run_id = %s AND dictionary_sha256 IS NOT DISTINCT FROM %s AND rules_sha256 = %s"
-        " ORDER BY id DESC LIMIT 1",
+        " ORDER BY id DESC",
         (after[1], after[2], after[3]),
-    ).fetchone()
+    ).fetchall()
+
+    def same_basis(row) -> bool:
+        return _basis(row) == _basis(after)
+
+    before = next((row for row in candidates if same_basis(row)), None)
     lines: list[str] = []
     if before is None:
         before = connection.execute(
@@ -329,9 +362,24 @@ def report(connection: psycopg.Connection) -> str:
         ).fetchone()
         if before:
             lines.append(
-                "warning: no 'before' measurement has the run, dictionary and rules of the "
-                "'after'; the two below are on a different basis and are not comparable"
+                "warning: no 'before' measurement has the run, dictionary, rules, given up and "
+                "stale papers of the 'after'; the two below are on a different basis and are "
+                "not comparable"
             )
     lines += _block("before", before) if before else ["before: no measurements"]
     lines += _block("after", after)
     return "\n".join([*lines, CAVEAT])
+
+
+def _basis(row) -> tuple:
+    """What two measurements must share to be compared: the run, the dictionary, the rules,
+    and the papers the figures leave out (given up, stale)."""
+    _, run_id, dictionary, rules, _, metrics = row
+    metrics = metrics if isinstance(metrics, dict) else {}
+    return (
+        run_id,
+        dictionary,
+        rules,
+        _papers(metrics, "given_up_papers"),
+        _papers(metrics, "stale_papers"),
+    )

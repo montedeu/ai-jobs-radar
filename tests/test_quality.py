@@ -311,12 +311,14 @@ def test_cli_measure_reports_a_bad_gold_file(world, database_url, monkeypatch, t
 def test_gold_paper_with_an_old_mark_and_no_give_up_is_scored_by_its_old_mentions(
     connection, world
 ):
-    connection.execute("UPDATE paper SET abstract_hash = 'changed' WHERE arxiv_id = '2511.00002'")
+    # 2511.00001 has two hits among its old mentions (LoRA, Llama); the abstract changed after.
+    connection.execute("UPDATE paper SET abstract_hash = 'changed' WHERE arxiv_id = '2511.00001'")
     result = measure(connection, world)
-    # The old mark makes it extracted: its old survey mention is predicted, as the service
-    # serves it.
-    assert result.overall_untyped.predicted == 5
+    assert (result.overall_typed.predicted, result.overall_typed.true_positives) == (5, 2)
+    assert (result.overall_typed.gold, result.overall_typed.recall) == (4, 2 / 4)
     assert result.given_up_papers == ()
+    assert result.stale_papers == ("2511.00001",)
+    assert logged(connection) == 1
 
 
 def test_dictionary_key_by_old_rules_stops_the_measurement(connection, world):
@@ -497,6 +499,28 @@ def test_paper_with_an_old_mark_given_up_on_its_new_abstract_is_scored_by_its_ol
     # The old mentions are predicted as the service serves them: both hit the gold.
     assert (result.overall_typed.predicted, result.overall_typed.true_positives) == (7, 4)
     assert result.given_up_papers == ()
+    # Its old mark makes it extracted, but its abstract is not the one the run last saw.
+    assert result.stale_papers == ("2511.00004",)
+    assert "stale: 1 (2511.00004)" in quality.format_measurement(result)
+
+
+def test_report_warns_when_the_before_had_a_stale_paper_the_after_does_not(connection, world):
+    gold = gold_with_given_up_paper(connection)
+    connection.execute(
+        "INSERT INTO paper_extraction (run_id, arxiv_id, abstract_hash, input_tokens,"
+        " output_tokens) VALUES (%s, '2511.00004', 'old', 1, 1)",
+        (world,),
+    )
+    give_up(connection, world, "2511.00004")
+    measure(connection, world, gold)  # before: 2511.00004 is stale
+    # The run extracts the new abstract: the paper is no longer stale.
+    connection.execute(
+        "UPDATE paper_extraction SET abstract_hash = 'h' WHERE run_id = %s"
+        " AND arxiv_id = '2511.00004'",
+        (world,),
+    )
+    measure(connection, world, gold, label="after")
+    assert "warning: no 'before' measurement has the run" in quality.report(connection)
 
 
 def test_paper_with_attempts_and_a_current_mark_is_not_given_up(connection, world):
