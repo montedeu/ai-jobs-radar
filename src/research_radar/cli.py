@@ -16,6 +16,8 @@ COMMANDS = {
     "frequencies": "write the shares of the top entities of an extraction run to a Markdown file",
     "full-run": "estimate and, with --confirm, send the whole history to extraction (paid)",
     "abandon-batch": "give up a batch stuck in 'sending' or 'submitted' (its cost stays spent)",
+    "measure": "compare an extraction run with the gold set and log the measurement",
+    "measurements": "print the latest 'before' and 'after' measurements of extraction quality",
     "serve-mcp": "serve the MCP server on $PORT",
 }
 
@@ -108,6 +110,15 @@ def main(argv: list[str] | None = None) -> None:
     abandon.add_argument("batch_id", type=_positive, help="the extraction batch id")
     abandon.add_argument(
         "--confirm", action="store_true", help="give the batch up; without it only describe it"
+    )
+    measure = parsers["measure"]
+    measure.add_argument("--run", type=_positive, required=True, help="the extraction run id")
+    measure.add_argument("--gold", type=Path, required=True, help="the gold set, JSON Lines")
+    measure.add_argument(
+        "--label",
+        choices=("before", "after"),
+        required=True,
+        help="the gold set before or after the corrections of its labels",
     )
     args = parser.parse_args(argv)
     if args.command == "full-run":
@@ -203,6 +214,38 @@ def main(argv: list[str] | None = None) -> None:
             # The extraction steps refuse a connection with a transaction open.
             connection.autocommit = True
             _abandon_batch(connection, extraction, args.batch_id, args.confirm)
+    elif args.command == "measure":
+        import hashlib
+
+        from research_radar import database, quality
+
+        try:
+            raw = args.gold.read_bytes()
+            gold = quality.read_gold(args.gold)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"error: {error}") from error
+        with database.connect() as connection:
+            try:
+                result = quality.measure(
+                    connection,
+                    args.run,
+                    gold,
+                    gold_sha256=hashlib.sha256(raw).hexdigest(),
+                    label=args.label,
+                )
+            except ValueError as error:
+                raise SystemExit(f"error: {error}") from error
+        print(f"measurement logged ({result.label}, run {result.run_id})")
+        print(
+            f"overall, typed: precision {result.overall_typed.precision}, "
+            f"recall {result.overall_typed.recall}"
+        )
+        print(quality.CAVEAT)
+    elif args.command == "measurements":
+        from research_radar import database, quality
+
+        with database.connect() as connection:
+            print(quality.report(connection))
     elif args.command == "serve-mcp":
         from research_radar import mcp_server
 
