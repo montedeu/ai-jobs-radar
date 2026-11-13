@@ -110,7 +110,7 @@ jobs:
           gcloud run jobs deploy "$COLLECT_JOB" \
             --image "$IMAGE" --args daily \
             --service-account "$RUNTIME_SA" \
-            --set-secrets DATABASE_URL=database-url:latest \
+            --set-secrets DATABASE_URL=database-url:latest,ANTHROPIC_API_KEY=anthropic-extraction-key:latest \
             --tasks 1 --parallelism 1 --max-retries 0 --task-timeout 60m \
             --cpu 1 --memory 512Mi --quiet
 
