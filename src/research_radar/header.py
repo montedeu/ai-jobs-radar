@@ -23,8 +23,9 @@ NOTES = [
 # Over the papers of the collected slices since HISTORY_START: the earliest one the run has
 # neither finished nor given up on, and the latest one it has finished. A paper the run has
 # finished counts as processed even if its abstract changed afterwards: its old mentions stay
-# until the daily extraction re-runs it. Checking the hash here would roll the boundary back
-# to old, already-corrected papers almost every day.
+# until the daily extraction re-runs it; if the run gave up on the new abstract, until the
+# next full run. Checking the hash here would roll the boundary back to old,
+# already-corrected papers almost every day.
 _BOUNDS = (
     """
     SELECT min(p.first_version_date) FILTER (WHERE e.arxiv_id IS NULL AND g.arxiv_id IS NULL),

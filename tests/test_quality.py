@@ -308,11 +308,15 @@ def test_cli_measure_reports_a_bad_gold_file(world, database_url, monkeypatch, t
         cli.main(["measure", "--run", str(world), "--gold", str(path), "--label", "before"])
 
 
-def test_gold_paper_with_a_stale_abstract_stops_the_measurement(connection, world):
+def test_gold_paper_with_an_old_mark_and_no_give_up_is_scored_by_its_old_mentions(
+    connection, world
+):
     connection.execute("UPDATE paper SET abstract_hash = 'changed' WHERE arxiv_id = '2511.00002'")
-    with pytest.raises(ValueError, match="2511.00002"):
-        measure(connection, world)
-    assert logged(connection) == 0
+    result = measure(connection, world)
+    # The old mark makes it extracted: its old survey mention is predicted, as the service
+    # serves it.
+    assert result.overall_untyped.predicted == 5
+    assert result.given_up_papers == ()
 
 
 def test_dictionary_key_by_old_rules_stops_the_measurement(connection, world):
@@ -472,7 +476,9 @@ def test_report_reads_old_rows_without_given_up_papers(connection, world):
     assert "given up: 0" in quality.report(connection)
 
 
-def test_given_up_paper_with_mentions_of_an_old_abstract_predicts_nothing(connection, world):
+def test_paper_with_an_old_mark_given_up_on_its_new_abstract_is_scored_by_its_old_mentions(
+    connection, world
+):
     gold = gold_with_given_up_paper(connection)
     # Extracted on the old abstract, then the abstract changed and the run gave up on the new.
     connection.execute(
@@ -488,8 +494,9 @@ def test_given_up_paper_with_mentions_of_an_old_abstract_predicts_nothing(connec
         )
     give_up(connection, world, "2511.00004")
     result = measure(connection, world, gold)
-    assert (result.overall_typed.predicted, result.overall_typed.true_positives) == (5, 2)
-    assert result.given_up_papers == ("2511.00004",)
+    # The old mentions are predicted as the service serves them: both hit the gold.
+    assert (result.overall_typed.predicted, result.overall_typed.true_positives) == (7, 4)
+    assert result.given_up_papers == ()
 
 
 def test_paper_with_attempts_and_a_current_mark_is_not_given_up(connection, world):

@@ -147,21 +147,18 @@ def _measure(
     }
     if missing := sorted(set(ids) - known):
         raise ValueError(f"gold papers not in the database: {', '.join(missing)}")
-    # A paper whose abstract changed after the run read it is not finished for that run:
-    # the mentions belong to the old text.
-    current = {
+    # A paper with a mark under any abstract is extracted: its mentions are scored as the
+    # service serves them, the old ones included (#71). Only a paper with no mark at all
+    # can be given up on, and then it counts as an empty prediction, so the failure shows
+    # in the recall instead of blocking (ADR 0005, #65).
+    marked = {
         r[0]
         for r in connection.execute(
-            "SELECT p.arxiv_id FROM paper p JOIN paper_extraction e ON e.arxiv_id = p.arxiv_id"
-            " AND e.abstract_hash = p.abstract_hash"
-            " WHERE e.run_id = %s AND p.arxiv_id = ANY(%s)",
+            "SELECT arxiv_id FROM paper_extraction WHERE run_id = %s AND arxiv_id = ANY(%s)",
             (run_id, ids),
         )
     }
-    # A paper the run gave up on (the rule of the run itself) has no mark and never will: it
-    # counts as an empty prediction, so the failure shows in the recall instead of blocking
-    # (ADR 0005, #65). One with a current mark is extracted, whatever the attempts were.
-    unmarked = set(ids) - current
+    unmarked = set(ids) - marked
     given_up = {
         r[0]
         for r in connection.execute(
@@ -171,8 +168,7 @@ def _measure(
     }
     if unfinished := sorted(unmarked - given_up):
         raise ValueError(
-            f"run {run_id} has no completion mark for the current abstract of gold papers: "
-            + ", ".join(unfinished)
+            f"run {run_id} has no completion mark for gold papers: " + ", ".join(unfinished)
         )
     synonyms = dict(connection.execute("SELECT normal_form, canonical_name FROM synonym"))
     if stale := sorted(key for key in synonyms if key != normalize.normal_form(key)):
