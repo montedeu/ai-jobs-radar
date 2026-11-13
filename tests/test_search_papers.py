@@ -319,10 +319,10 @@ def test_processed_through_is_none_when_the_first_paper_of_the_history_is_missin
     assert found(client)["header"]["processed_through"] is None
 
 
-def test_a_paper_whose_abstract_changed_is_not_processed(client, connection, world):
+def test_a_paper_whose_abstract_changed_still_counts_as_processed(client, connection, world):
     connection.execute("UPDATE paper SET abstract_hash = 'new' WHERE arxiv_id = '2511.00002'")
 
-    assert found(client)["header"]["processed_through"] == "2025-11-09"
+    assert found(client)["header"]["processed_through"] == "2025-11-30"
 
 
 @pytest.mark.parametrize("entity", ["   ", "", "...", ",;:"])

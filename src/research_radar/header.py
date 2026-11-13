@@ -21,8 +21,10 @@ NOTES = [
 ]
 
 # Over the papers of the collected slices since HISTORY_START: the earliest one the run has
-# neither finished nor given up on, and the latest one it has finished. A paper whose
-# abstract changed since its extraction is not finished (as in daily_extraction._DUE_SQL).
+# neither finished nor given up on, and the latest one it has finished. A paper the run has
+# finished counts as processed even if its abstract changed afterwards: its old mentions stay
+# until the daily extraction re-runs it. Checking the hash here would roll the boundary back
+# to old, already-corrected papers almost every day.
 _BOUNDS = (
     """
     SELECT min(p.first_version_date) FILTER (WHERE e.arxiv_id IS NULL AND g.arxiv_id IS NULL),
@@ -32,7 +34,6 @@ _BOUNDS = (
     + """) s
       JOIN paper p ON p.arxiv_id = s.arxiv_id
       LEFT JOIN paper_extraction e ON e.run_id = %(run)s AND e.arxiv_id = s.arxiv_id
-                             AND e.abstract_hash = p.abstract_hash
       LEFT JOIN ("""
     + GIVEN_UP_SQL
     + """) g ON g.arxiv_id = s.arxiv_id
