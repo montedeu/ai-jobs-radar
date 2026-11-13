@@ -9,6 +9,7 @@ import random
 import psycopg
 import pytest
 
+from research_radar import quality
 from research_radar.normalize import normal_form
 from research_radar.synonyms import SYNONYMS_FILE, load_synonyms, read_synonyms
 
@@ -279,3 +280,18 @@ def test_changing_dictionary_changes_canonical_names_without_extraction(database
         assert names() == {"Retrieval-Augmented Generation"}
 
         assert frozen() == before
+
+
+# --- frozen rules ---------------------------------------------------------------------------
+
+# The version of the normal form rules: the same value quality.rules_sha256() writes to
+# quality_measurement.rules_sha256. Stored normal forms were computed by these rules at
+# extraction time and nothing recomputes them (ADR 0002, ticket #66).
+NORMALIZE_SHA256 = "955592ee130427c74b1551707c0a2886e67fb6528d8bf776c2726c2f03887fec"
+
+
+def test_normal_form_rules_are_frozen():
+    assert quality.rules_sha256() == NORMALIZE_SHA256, (
+        "правила нормальной формы заморожены (ADR 0002); менять только с решением разработчика "
+        "и новым полным прогоном"
+    )
