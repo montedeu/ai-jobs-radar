@@ -541,6 +541,16 @@ run gcloud secrets add-iam-policy-binding "$TOKEN_SECRET" --project="$GCP_PROJEC
   --member="serviceAccount:$GCP_RUNTIME_SA" --role=roles/secretmanager.secretAccessor --format=none
 note "To read it later:"
 note "  gcloud secrets versions access latest --secret=$TOKEN_SECRET --project=$GCP_PROJECT_ID"
+# The Anthropic keys are created by hand in the console and stored by the developer (#22);
+# deploy.yml hands anthropic-extraction-key to the collect job, so the runtime account reads it.
+for ANTHROPIC_SECRET in anthropic-extraction-key anthropic-agent-key; do
+  if gcloud secrets describe "$ANTHROPIC_SECRET" --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
+    run gcloud secrets add-iam-policy-binding "$ANTHROPIC_SECRET" --project="$GCP_PROJECT_ID" \
+      --member="serviceAccount:$GCP_RUNTIME_SA" --role=roles/secretmanager.secretAccessor --format=none
+  else
+    warn "Secret $ANTHROPIC_SECRET does not exist yet: store the key (#22), then run this again before deploying."
+  fi
+done
 pause
 
 # ── 11 ────────────────────────────────────────────────────────────────────
